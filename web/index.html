@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#f8f8f5">
+  <title>Nexus — 帮你把灵感落地</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Nexus 首页">
+        <span class="brand-mark">N</span><span class="brand-copy"><b>Nexus</b><small>帮你把灵感落地</small></span>
+      </a>
+      <button id="newProject" class="new-project"><span>＋</span> 新建项目</button>
+      <div class="nav-label">最近项目</div>
+      <div id="projectList" class="project-list"><div class="sidebar-empty">还没有项目</div></div>
+      <div class="sidebar-bottom">
+        <div class="local-note"><span class="local-dot"></span><span>仅在本机运行<small>项目与成果保存在本地</small></span></div>
+        <button id="openSettings" class="settings-link"><span>⚙</span> 模型设置 <span id="configDot" class="config-dot"></span></button>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div class="breadcrumb"><span>项目工作区</span><span class="crumb-sep">/</span><strong id="projectTitle">新建项目</strong></div>
+        <div class="top-actions"><select id="mobileProjectSelect" class="mobile-project-select" aria-label="切换项目"><option value="">项目列表</option></select><button id="modelBadge" class="model-badge" aria-label="模型设置"><span class="status-dot"></span>模型未配置</button><button class="avatar" title="本地工作台">N</button></div>
+      </header>
+
+      <section id="welcome" class="welcome-view">
+        <div class="welcome-content">
+          <div class="eyebrow"><span class="sparkle">✳</span> 从想法开始，走向可运行的产品</div>
+          <h1>一个好产品，<br><span>从一次清晰的对话开始。</span></h1>
+          <p class="welcome-subtitle">把你的想法或 PRD 交给 Agent，一起梳理需求、确认组件与架构，再分别推进前后端开发。</p>
+          <div class="composer welcome-composer">
+            <textarea id="briefInput" rows="4" placeholder="描述你想做什么……例如：我想做一个帮助团队跟踪客户反馈的 AI 助手。"></textarea>
+            <div id="feishuImport" class="feishu-import hidden">
+              <div class="feishu-import-row"><input id="feishuUrl" type="url" inputmode="url" placeholder="粘贴飞书文档或 Markdown 文件链接" aria-label="飞书文档链接"><button id="loadFeishuPrd" type="button">读取飞书文档</button></div>
+              <div id="feishuNotice" class="feishu-notice hidden" role="status"></div>
+              <div id="feishuAccount" class="feishu-account hidden"><button id="connectFeishu" type="button">连接飞书账号</button><span>读取私有文档时需要当前账号授权</span></div>
+              <div id="feishuAuthFlow" class="feishu-auth-flow hidden">
+                <p>请在飞书页面确认登录和授权，然后回到这里继续。</p>
+                <a id="feishuAuthLink" target="_blank" rel="noopener noreferrer">打开飞书授权页面</a>
+                <span id="feishuAuthCode" class="hidden"></span>
+                <img id="feishuAuthQr" alt="飞书登录二维码">
+                <button id="completeFeishuAuth" type="button">我已完成授权</button>
+              </div>
+            </div>
+            <div class="composer-footer"><div class="composer-hints"><span>Enter 换行 · 先有想法也可以</span><label class="attach-button" for="briefFile">＋ 附加 PRD</label><input id="briefFile" type="file" accept=".md,.markdown,.txt,text/plain,text/markdown" hidden></div><button id="startProject" class="send-button">开始梳理 <span>↗</span></button></div>
+            <div id="fileNotice" class="file-notice hidden"></div>
+          </div>
+          <div class="starter-row"><span>选择开始方式</span><button data-starter data-mode="idea" aria-pressed="true" class="selected">✳　我有一个想法</button><button data-starter data-mode="prd" aria-pressed="false">▤　我有一份 PRD</button></div>
+        </div>
+      </section>
+
+      <section id="workspace" class="workspace-view hidden">
+        <div class="workflow-bar" id="workflowBar"></div>
+        <div id="workGrid" class="work-grid">
+          <section class="conversation-panel">
+            <div class="section-heading"><div><span class="section-kicker" id="phaseKicker">第一步</span><h2 id="phaseTitle">需求梳理</h2></div><button id="toggleRight" class="icon-button" title="显示或隐藏成果面板">▤</button></div>
+            <div class="phase-intro" id="phaseIntro"></div>
+            <section id="discoverySummary" class="discovery-summary hidden" aria-live="polite"></section>
+            <div id="phaseControls" class="phase-controls"></div>
+            <div id="messages" class="messages"></div>
+            <div id="runningBanner" class="running-banner hidden"><span class="spinner"></span><span id="runningText">Agent 正在思考…</span><button id="stopWait" class="text-button">隐藏</button></div>
+            <div id="errorBanner" class="error-banner hidden"></div>
+            <div class="composer chat-composer">
+              <textarea id="chatInput" rows="2" placeholder="补充信息，或针对当前方案提出修改…"></textarea>
+              <div class="composer-footer"><span>Enter 发送 · Shift+Enter 换行 · 所有确认由你决定</span><button id="sendMessage" class="send-button">发送 <span>↗</span></button></div>
+            </div>
+          </section>
+
+          <div id="panelSplitter" class="panel-splitter" role="separator" aria-label="调整右侧工作台宽度" aria-orientation="vertical" tabindex="0"></div>
+          <aside id="deliverables" class="deliverables-panel">
+            <div class="deliverable-heading"><div><span class="section-kicker">项目资料</span><h2>成果与进度</h2></div><span id="fileCount" class="count-pill">0</span></div>
+            <div id="scopeCard" class="scope-card hidden"><div class="scope-label">开发范围</div><div id="scopeLabel" class="scope-value">尚未确定</div></div>
+            <div id="tasksList" class="tasks-list"></div>
+            <div class="deliverable-tabs" id="deliverableTabs"></div>
+            <div id="deliverableContent" class="deliverable-content"></div>
+            <div class="panel-footer"><span class="local-dot"></span>成果保存在本机项目目录</div>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="settingsDialog" class="settings-dialog">
+    <form method="dialog" class="dialog-top"><div><span class="section-kicker">本地连接</span><h2>模型设置</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></form>
+    <p class="settings-description">填写 Anthropic 或兼容服务的模型配置。API Key 只保存在项目根目录的本地 <code>.env</code> 文件中。</p>
+    <form id="settingsForm" class="settings-form">
+      <label>API Key<input id="apiKey" type="password" autocomplete="new-password" placeholder="已配置时留空可保留现有密钥"></label>
+      <label>模型名称<input id="modelName" value="claude-sonnet-4-6" placeholder="例如 claude-sonnet-4-6" required></label>
+      <label>兼容 API 地址 <span class="optional">选填</span><input id="baseUrl" type="url" placeholder="https://api.anthropic.com"></label>
+      <div id="settingsError" class="settings-error hidden"></div>
+      <div class="dialog-actions"><button type="button" id="cancelSettings" class="secondary-button">取消</button><button class="send-button" type="submit">保存并连接 <span>↗</span></button></div>
+    </form>
+  </dialog>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
