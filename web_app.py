@@ -325,7 +325,7 @@ def _read_models() -> dict:
 
 def _public_models(data: dict) -> list:
     return [{"id": p["id"], "name": p["name"], "base_url": p["base_url"],
-             "models": p["models"], "has_key": bool(p.get("api_key"))} for p in data["providers"]]
+             "models": p["models"], "model_profiles": p.get("model_profiles", {}), "has_key": bool(p.get("api_key"))} for p in data["providers"]]
 
 
 def _resolve_model(selection: object, data: dict | None = None) -> dict:
@@ -335,7 +335,10 @@ def _resolve_model(selection: object, data: dict | None = None) -> dict:
     model = selection.get("model")
     if not provider or model not in provider["models"] or not provider.get("api_key"):
         raise ValueError("项目所选模型已不可用，请重新选择模型。")
-    return {"api_key": provider["api_key"], "base_url": provider["base_url"], "model": model}
+    snapshot = {"api_key": provider["api_key"], "base_url": provider["base_url"], "model": model}
+    if model in provider.get("model_profiles", {}):
+        snapshot["profile"] = provider["model_profiles"][model]
+    return snapshot
 
 
 def _client(snapshot: dict | None = None) -> Anthropic:
@@ -429,11 +432,54 @@ def _complete_text_response(client: Anthropic, request_args: dict, response) -> 
     raise ValueError("模型输出未能完成，请重试。")
 
 
+MODEL_PROFILES = {"auto", "forced", "automatic", "deepseek"}
+
+
 def _apply_tool_compatibility(snapshot: dict | None, request_args: dict) -> None:
-    """DeepSeek requires thinking disabled when a specific tool is forced."""
-    host = (urlparse((snapshot or {}).get("base_url", "")).hostname or "").lower()
-    if host == "api.deepseek.com" and request_args.get("tool_choice", {}).get("type") == "tool":
+    """Select tool behavior for the specific model without changing other requests."""
+    if request_args.get("tool_choice", {}).get("type") != "tool":
+        return
+    snapshot = snapshot or {}
+    profile = snapshot.get("profile", "auto")
+    if profile not in MODEL_PROFILES:
+        raise ValueError("模型兼容方式无效，请在模型设置中重新选择。")
+    host = (urlparse(snapshot.get("base_url", "")).hostname or "").lower()
+    if profile == "automatic":
+        request_args["tool_choice"] = {"type": "auto"}
+    elif profile == "deepseek" or (profile == "auto" and host == "api.deepseek.com"):
         request_args["thinking"] = {"type": "disabled"}
+
+
+def _valid_discovery_response(response) -> bool:
+    blocks = [b for b in response.content if getattr(b, "type", "") == "tool_use" and getattr(b, "name", "") == "discovery_update"]
+    if len(blocks) != 1 or not isinstance(getattr(blocks[0], "input", None), dict):
+        return False
+    data = blocks[0].input
+    return (isinstance(data.get("assistant_message"), str) and bool(data["assistant_message"].strip())
+            and data.get("stage") in DISCOVERY_STAGES and isinstance(data.get("ready_for_draft"), bool)
+            and isinstance(data.get("open_questions"), list) and all(isinstance(q, str) for q in data["open_questions"])
+            and isinstance(data.get("facts"), list) and all(isinstance(f, dict) and f.get("key") in DISCOVERY_FIELDS
+                and isinstance(f.get("value"), str) and isinstance(f.get("evidence"), str) for f in data["facts"]))
+
+
+def _validate_generated_files(session_id: str, response) -> list:
+    blocks = [b for b in response.content if getattr(b, "type", "") == "tool_use" and getattr(b, "name", "") == "save_files"]
+    if len(blocks) != 1 or not isinstance(getattr(blocks[0], "input", None), dict):
+        raise ValueError("模型未返回所需的文件结果，请检查模型工具调用兼容性后重试。")
+    files = blocks[0].input.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("模型没有生成文件，请重试或更换支持工具调用的模型。")
+    destination = (OUTPUT_DIR / session_id).resolve()
+    seen = set()
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not isinstance(item.get("content"), str):
+            raise ValueError("模型返回的文件格式无效，请重试。")
+        path = Path(item["path"])
+        target = (destination / path).resolve()
+        if path.is_absolute() or not path.parts or any(x in ("..", ".") for x in path.parts) or not target.is_relative_to(destination) or target in seen:
+            raise ValueError("模型返回了无效或重复的文件路径，请重试。")
+        seen.add(target)
+    return files
 
 
 def _run_job(operation_id: str, session_id: str, phase: str, prompt: str,
@@ -462,25 +508,28 @@ def _run_job(operation_id: str, session_id: str, phase: str, prompt: str,
             })
         _apply_tool_compatibility(snapshot, request_args)
         response = client.messages.create(**request_args)
-        if task_mode == "discovery" and response.stop_reason != "max_tokens":
-            def has_discovery_reply(result) -> bool:
-                return any(getattr(block, "type", "") == "tool_use"
-                           and getattr(block, "name", "") == "discovery_update"
-                           and isinstance(getattr(block, "input", None), dict)
-                           and isinstance(block.input.get("assistant_message"), str)
-                           and block.input["assistant_message"].strip()
-                           for block in result.content)
-            if not has_discovery_reply(response):
+        structured = task_mode == "discovery" or (save_result and phase in ("frontend", "backend"))
+        if task_mode == "discovery" and response.stop_reason != "max_tokens" and not _valid_discovery_response(response):
+            response = client.messages.create(**request_args)
+        elif save_result and phase in ("frontend", "backend") and response.stop_reason != "max_tokens":
+            try:
+                _validate_generated_files(session_id, response)
+            except ValueError:
                 response = client.messages.create(**request_args)
         if response.stop_reason == "max_tokens" and (task_mode == "discovery" or phase in ("frontend", "backend")):
             raise ValueError("模型输出达到长度上限，结构化结果尚未完整。请缩小本轮范围后重试。")
+        if structured and response.stop_reason not in ("tool_use", "end_turn"):
+            raise ValueError("模型未完整返回结构化结果，请重试。")
+        if task_mode == "discovery" and not _valid_discovery_response(response):
+            raise ValueError("模型返回的访谈结果不完整，请检查工具调用兼容性后重试；本轮回答已保留。")
+        files = _validate_generated_files(session_id, response) if save_result and phase in ("frontend", "backend") else None
         text = _complete_text_response(client, request_args, response)
         discovery_update = None
         for block in response.content:
             if task_mode == "discovery" and getattr(block, "type", "") == "tool_use" and block.name == "discovery_update":
                 discovery_update = block.input
-            if save_result and getattr(block, "type", "") == "tool_use" and block.name == "save_files":
-                artifacts.extend(_write_files(session_id, block.input.get("files", [])))
+        if files is not None:
+            artifacts.extend(_write_files(session_id, files))
         if task_mode == "discovery":
             if not isinstance(discovery_update, dict):
                 raise ValueError("访谈结果格式无效，请重试；本轮回答已保留。")
@@ -488,8 +537,10 @@ def _run_job(operation_id: str, session_id: str, phase: str, prompt: str,
             if not text:
                 raise ValueError("访谈没有生成下一步问题，请重试；本轮回答已保留。")
         if not text:
-            text = ("已生成以下文件：\n" + "\n".join(f"- {name}" for name in artifacts)
-                    if artifacts else "已完成本阶段输出。")
+            if artifacts:
+                text = "已生成以下文件：\n" + "\n".join(f"- {name}" for name in artifacts)
+            else:
+                raise ValueError("模型没有返回有效内容，请重试。")
         all_artifacts = []
         if save_result:
             filename = f"{_now()[:10]}-{phase}-{uuid.uuid4().hex[:6]}.md"
@@ -711,7 +762,11 @@ class Handler(BaseHTTPRequestHandler):
                     key = key or (old.get("api_key", "") if old else "")
                     if len(key) < 8 or any(ord(c) < 32 for c in key) or "xxx" in key.lower():
                         raise ValueError("请填写有效的 API Key。")
-                    item = {"id": provider_id or str(uuid.uuid4()), "name": name, "base_url": base_url, "api_key": key, "models": models}
+                    profiles = body.get("model_profiles", old.get("model_profiles", {}) if old else {})
+                    if not isinstance(profiles, dict) or any(not isinstance(k, str) or not isinstance(v, str) or v not in MODEL_PROFILES for k, v in profiles.items()):
+                        raise ValueError("模型兼容方式无效。")
+                    profiles = {k: v for k, v in profiles.items() if k in models and v != "auto"}
+                    item = {"id": provider_id or str(uuid.uuid4()), "name": name, "base_url": base_url, "api_key": key, "models": models, "model_profiles": profiles}
                     if old:
                         data["providers"][data["providers"].index(old)] = item
                     else:
@@ -747,20 +802,42 @@ class Handler(BaseHTTPRequestHandler):
                     parsed_url = urlparse(base_url)
                     if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname or parsed_url.username or parsed_url.password or any(ord(c) < 32 for c in base_url):
                         raise ValueError("兼容 API 地址格式无效。")
-                snapshot = {"api_key": key, "base_url": base_url, "model": model}
+                profile = body.get("profile", "auto")
+                if not isinstance(profile, str) or profile not in MODEL_PROFILES:
+                    raise ValueError("模型兼容方式无效。")
+                snapshot = {"api_key": key, "base_url": base_url, "model": model, "profile": profile}
+                client = _client(snapshot).with_options(timeout=30, max_retries=0)
+                def describe_error(exc: Exception) -> str:
+                    if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+                        return "认证失败或账号无权使用此模型，请检查密钥和账号权限。"
+                    if isinstance(exc, (NotFoundError, BadRequestError)):
+                        return "服务未接受请求，请检查 API 地址、模型 ID 和兼容方式。"
+                    if isinstance(exc, RateLimitError):
+                        return "请求受到限制，请检查额度或稍后重试。"
+                    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+                        return "无法连接模型服务或请求超时，请检查地址和网络。"
+                    return "请求失败，请检查连接配置后重试。"
                 try:
-                    _client(snapshot).with_options(timeout=30, max_retries=0).messages.create(model=model, max_tokens=16, messages=[{"role": "user", "content": "Reply OK."}])
-                except (AuthenticationError, PermissionDeniedError):
-                    return self._json(400, {"error": "认证失败或账号无权使用此模型，请检查密钥和账号权限。"})
-                except (NotFoundError, BadRequestError):
-                    return self._json(400, {"error": "服务未接受请求，请检查 API 地址和模型 ID。"})
-                except RateLimitError:
-                    return self._json(400, {"error": "请求受到限制，请检查额度或稍后重试。"})
-                except (APIConnectionError, APITimeoutError):
-                    return self._json(400, {"error": "无法连接模型服务或请求超时，请检查地址和网络。"})
-                except Exception:
-                    return self._json(400, {"error": "连接测试失败，请检查模型 ID、API 地址、密钥及账号权限。"})
-                return self._json(200, {"ok": True})
+                    client.messages.create(model=model, max_tokens=64, messages=[{"role": "user", "content": "Reply OK."}])
+                except Exception as exc:
+                    return self._json(200, {"connection": {"ok": False, "message": describe_error(exc)},
+                                            "tool_call": {"ok": None, "message": "基础连接未通过，未测试工具调用。"}})
+                probe = {"model": model, "max_tokens": 1024,
+                         "messages": [{"role": "user", "content": "Call the compatibility_check tool with result set to ok."}],
+                         "tools": [{"name": "compatibility_check", "description": "Return a test result.",
+                                    "input_schema": {"type": "object", "properties": {"result": {"type": "string"}}, "required": ["result"]}}],
+                         "tool_choice": {"type": "tool", "name": "compatibility_check"}}
+                _apply_tool_compatibility(snapshot, probe)
+                try:
+                    result = client.messages.create(**probe)
+                    valid = result.stop_reason != "max_tokens" and any(
+                        getattr(b, "type", "") == "tool_use" and getattr(b, "name", "") == "compatibility_check"
+                        and isinstance(getattr(b, "input", None), dict) and isinstance(b.input.get("result"), str)
+                        and b.input["result"].strip().lower() == "ok" for b in result.content)
+                    tool_result = {"ok": valid, "message": "工具调用通过。" if valid else "模型未返回完整的工具结果，请检查兼容方式。"}
+                except Exception as exc:
+                    tool_result = {"ok": False, "message": describe_error(exc)}
+                return self._json(200, {"connection": {"ok": True, "message": "基础连接通过。"}, "tool_call": tool_result})
             match = re.fullmatch(r"/api/sessions/([a-f0-9-]+)/model", self.path)
             if match:
                 with _lock:

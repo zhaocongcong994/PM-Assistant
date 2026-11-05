@@ -105,7 +105,9 @@
           </div>
           <div class="settings-column">
             <label>模型 ID（每行一个）<textarea id="modelNames" rows="5" placeholder="MiniMax-M3&#10;MiniMax-M2.7" required></textarea></label>
-            <label>测试型号<select id="testModel"></select></label>
+            <label>测试和设置的型号<select id="testModel"></select></label>
+            <label>该型号的工具调用方式<select id="modelProfile"><option value="auto">自动识别（推荐）</option><option value="forced">指定工具</option><option value="automatic">自动选择工具</option><option value="deepseek">DeepSeek 兼容方式</option></select></label>
+            <small class="settings-hint">自动识别根据官方 DeepSeek 地址选用兼容方式，其他地址默认使用指定工具；测试未通过时可调整。</small>
           </div>
         </div>
         <div id="settingsError" class="settings-error hidden" role="status"></div>

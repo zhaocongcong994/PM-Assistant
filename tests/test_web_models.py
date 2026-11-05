@@ -95,7 +95,13 @@ def test_connection_test_uses_unsaved_form_without_saving():
         class Client:
             def __init__(self): self.messages = self
             def with_options(self, **kwargs): return self
-            def create(self, **kwargs): calls.append(kwargs)
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs['model'] == 'fail-base':
+                    raise ValueError('fake service error')
+                if 'tools' in kwargs and kwargs['model'] != 'no-tool':
+                    return SimpleNamespace(stop_reason='tool_use', content=[SimpleNamespace(type='tool_use', name='compatibility_check', input={'result': 'ok'})])
+                return SimpleNamespace(stop_reason='end_turn', content=[])
         def client(snapshot):
             snapshots.append(snapshot.copy())
             return Client()
@@ -111,11 +117,18 @@ def test_connection_test_uses_unsaved_form_without_saving():
         try:
             saved = {'providers': [{'id': 'existing', 'name': 'Provider', 'api_key': 'saved-secret-key', 'base_url': 'https://old.example', 'models': ['old-model']}]}
             web_app._save_models(saved)
-            assert test_request({'id': 'existing', 'api_key': '', 'base_url': 'https://new.example', 'model': 'new-model'}) == {'ok': True}
-            assert snapshots[-1] == {'api_key': 'saved-secret-key', 'base_url': 'https://new.example', 'model': 'new-model'}
-            assert test_request({'id': '', 'api_key': 'new-secret-key', 'base_url': 'https://new.example', 'model': 'other-model'}) == {'ok': True}
+            result = test_request({'id': 'existing', 'api_key': '', 'base_url': 'https://new.example', 'model': 'new-model'})
+            assert result['connection']['ok'] and result['tool_call']['ok']
+            assert snapshots[-1] == {'api_key': 'saved-secret-key', 'base_url': 'https://new.example', 'model': 'new-model', 'profile': 'auto'}
+            result = test_request({'id': '', 'api_key': 'new-secret-key', 'base_url': 'https://new.example', 'model': 'other-model'})
+            assert result['connection']['ok'] and result['tool_call']['ok']
             assert snapshots[-1]['api_key'] == 'new-secret-key'
             assert calls[-1]['model'] == 'other-model'
+            failed_tool = test_request({'api_key': 'new-secret-key', 'base_url': 'https://new.example', 'model': 'no-tool', 'profile': 'automatic'})
+            assert failed_tool['connection']['ok'] is True and failed_tool['tool_call']['ok'] is False
+            assert calls[-1]['tool_choice'] == {'type': 'auto'}
+            failed_base = test_request({'api_key': 'new-secret-key', 'base_url': 'https://new.example', 'model': 'fail-base'})
+            assert failed_base['connection']['ok'] is False and failed_base['tool_call']['ok'] is None
             assert web_app._read_models() == saved
             try:
                 test_request({'id': '', 'api_key': '', 'base_url': '', 'model': 'other-model'})
@@ -127,3 +140,14 @@ def test_connection_test_uses_unsaved_form_without_saving():
             server.server_close()
             thread.join()
             for p in reversed(patches): p.stop()
+
+
+def test_per_model_compatibility_profile_is_resolved_independently():
+    data = {'providers': [{'id': 'p', 'name': 'test', 'api_key': 'test-secret', 'base_url': 'https://example.com', 'models': ['a', 'b'], 'model_profiles': {'a': 'automatic', 'b': 'deepseek'}}]}
+    first = web_app._resolve_model({'provider_id': 'p', 'model': 'a'}, data)
+    second = web_app._resolve_model({'provider_id': 'p', 'model': 'b'}, data)
+    assert first['profile'] == 'automatic'
+    assert second['profile'] == 'deepseek'
+    public = web_app._public_models(data)
+    assert public[0]['model_profiles'] == {'a': 'automatic', 'b': 'deepseek'}
+    assert 'test-secret' not in json.dumps(public)

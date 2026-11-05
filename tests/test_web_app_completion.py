@@ -106,3 +106,46 @@ def test_discovery_retries_once_when_tool_reply_is_empty():
                 assert web_app._operations['retry-test']['status'] == 'completed'
             finally:
                 del web_app._operations['retry-test']
+
+
+def test_missing_generated_files_is_failure_after_one_retry():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        client = FakeClient([response('生成完成', 'end_turn'), response('生成完成', 'end_turn')])
+        with patch.object(web_app, 'STATE_DIR', root), patch.object(web_app, 'STATE_PATH', root / 'sessions.json'), patch.object(web_app, 'OUTPUT_DIR', root / 'generated'), patch.object(web_app, '_client', return_value=client):
+            web_app._save_state({'sessions': [{'id': 'session', 'status': 'running', 'messages': [], 'phase_results': {}}]})
+            web_app._operations['missing-files'] = {'status': 'running'}
+            try:
+                web_app._run_job('missing-files', 'session', 'frontend', 'test', True, 'phase', {'model': 'test', 'base_url': '', 'api_key': 'test'})
+                session = web_app._find_session(web_app._read_state(), 'session')
+                assert len(client.calls) == 2
+                assert web_app._operations['missing-files']['status'] == 'failed'
+                assert '文件' in session['error']
+                assert not session['phase_results']
+            finally:
+                del web_app._operations['missing-files']
+
+
+def test_generated_file_validation_rejects_all_before_writing():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        tool = SimpleNamespace(type='tool_use', name='save_files', input={'files': [{'path': 'ok.py', 'content': 'ok'}, {'path': '../unsafe.py', 'content': 'bad'}]})
+        result = SimpleNamespace(content=[tool], stop_reason='tool_use')
+        with patch.object(web_app, 'OUTPUT_DIR', root):
+            try:
+                web_app._validate_generated_files('session', result)
+                assert False, 'unsafe paths must be rejected'
+            except ValueError:
+                assert not (root / 'session' / 'ok.py').exists()
+
+
+def test_model_profile_controls_forced_tool_behavior():
+    automatic = {'tool_choice': {'type': 'tool', 'name': 'discovery_update'}}
+    web_app._apply_tool_compatibility({'base_url': 'https://example.com', 'profile': 'automatic'}, automatic)
+    assert automatic['tool_choice'] == {'type': 'auto'}
+    deepseek = {'tool_choice': {'type': 'tool', 'name': 'save_files'}}
+    web_app._apply_tool_compatibility({'base_url': 'https://proxy.example', 'profile': 'deepseek'}, deepseek)
+    assert deepseek['thinking'] == {'type': 'disabled'}
+    forced = {'tool_choice': {'type': 'tool', 'name': 'save_files'}}
+    web_app._apply_tool_compatibility({'base_url': 'https://api.deepseek.com', 'profile': 'forced'}, forced)
+    assert 'thinking' not in forced

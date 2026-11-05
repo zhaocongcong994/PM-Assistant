@@ -39,6 +39,7 @@ let session = null;
 let config = {configured:false,providers:[]};
 let draftModel = null;
 let editingProviderId = '';
+let modelProfiles = {};
 let activeDeliverable = 'requirements';
 let pendingJob = null;
 let sessions = [];
@@ -359,6 +360,7 @@ function refreshTestModels() {
   const previous=$('testModel').value, models=modelNames();
   $('testModel').innerHTML=models.length?models.map(m=>`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join(''):'<option value="">请先填写模型 ID</option>';
   if(models.includes(previous))$('testModel').value=previous;
+  $('modelProfile').value=modelProfiles[$('testModel').value]||'auto';
 }
 function showProviderList() {
   editingProviderId='';$('apiKey').value='';showSettingsMessage('');
@@ -372,13 +374,13 @@ function editProvider(id='') {
   editingProviderId=id;
   const p=(config.providers||[]).find(item=>item.id===id);
   $('providerListView').classList.add('hidden');$('providerEditView').classList.remove('hidden');
-  $('providerName').value=p?.name||'';$('baseUrl').value=p?.base_url||'';$('modelNames').value=(p?.models||[]).join('\n');$('apiKey').value='';
+  $('providerName').value=p?.name||'';$('baseUrl').value=p?.base_url||'';$('modelNames').value=(p?.models||[]).join('\n');$('apiKey').value='';modelProfiles={...(p?.model_profiles||{})};
   $('savedKey').classList.toggle('hidden',!p?.has_key);$('keyField').classList.toggle('hidden',!!p?.has_key);
   refreshTestModels();showSettingsMessage('');
 }
 async function setupSettings() {
   try {
-    await request('/api/models',{method:'POST',body:JSON.stringify({id:editingProviderId,name:$('providerName').value,api_key:$('apiKey').value,base_url:$('baseUrl').value,models:modelNames()})});
+    await request('/api/models',{method:'POST',body:JSON.stringify({id:editingProviderId,name:$('providerName').value,api_key:$('apiKey').value,base_url:$('baseUrl').value,models:modelNames(),model_profiles:modelProfiles})});
     await refreshHealth();showProviderList();
   } catch(e){showSettingsMessage(e.message)}
 }
@@ -529,11 +531,13 @@ $('modelBadge').addEventListener('change',async e=>{
 $('newProvider').addEventListener('click',()=>editProvider(''));
 $('changeKey').addEventListener('click',()=>{$('savedKey').classList.add('hidden');$('keyField').classList.remove('hidden');$('apiKey').focus()});
 $('modelNames').addEventListener('input',refreshTestModels);
+$('testModel').addEventListener('change',()=>{$('modelProfile').value=modelProfiles[$('testModel').value]||'auto'});
+$('modelProfile').addEventListener('change',()=>{if($('testModel').value)modelProfiles[$('testModel').value]=$('modelProfile').value});
 $('testProvider').addEventListener('click',async()=>{
   const model=$('testModel').value;
   if(!model){showSettingsMessage('请先填写并选择要测试的模型 ID。');return;}
   $('testProvider').disabled=true;showSettingsMessage('正在测试连接…',false);
-  try {await request('/api/models/test',{method:'POST',body:JSON.stringify({id:editingProviderId,api_key:$('apiKey').value,base_url:$('baseUrl').value,model})});showSettingsMessage(`${model} 连接成功。`,false)}catch(e){showSettingsMessage(e.message)}finally{$('testProvider').disabled=false}
+  try {const result=await request('/api/models/test',{method:'POST',body:JSON.stringify({id:editingProviderId,api_key:$('apiKey').value,base_url:$('baseUrl').value,model,profile:$('modelProfile').value})});showSettingsMessage(`基础连接：${result.connection.message} 工具调用：${result.tool_call.message}`, !result.connection.ok||result.tool_call.ok!==true)}catch(e){showSettingsMessage(e.message)}finally{$('testProvider').disabled=false}
 });
 $('mobileProjectSelect').addEventListener('change',e=>{if(e.target.value)openSession(e.target.value)});
 $('cancelSettings').addEventListener('click',showProviderList);
