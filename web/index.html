@@ -26,7 +26,7 @@
     <main class="main-area">
       <header class="topbar">
         <div class="breadcrumb"><span>项目工作区</span><span class="crumb-sep">/</span><strong id="projectTitle">新建项目</strong></div>
-        <div class="top-actions"><select id="mobileProjectSelect" class="mobile-project-select" aria-label="切换项目"><option value="">项目列表</option></select><button id="modelBadge" class="model-badge" aria-label="模型设置"><span class="status-dot"></span>模型未配置</button><button class="avatar" title="本地工作台">N</button></div>
+        <div class="top-actions"><select id="mobileProjectSelect" class="mobile-project-select" aria-label="切换项目"><option value="">项目列表</option></select><select id="modelBadge" class="model-badge" aria-label="选择当前项目使用的模型"></select><button class="avatar" title="本地工作台">N</button></div>
       </header>
 
       <section id="welcome" class="welcome-view">
@@ -88,14 +88,30 @@
 
   <dialog id="settingsDialog" class="settings-dialog">
     <form method="dialog" class="dialog-top"><div><span class="section-kicker">本地连接</span><h2>模型设置</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></form>
-    <p class="settings-description">填写 Anthropic 或兼容服务的模型配置。API Key 只保存在项目根目录的本地 <code>.env</code> 文件中。</p>
-    <form id="settingsForm" class="settings-form">
-      <label>API Key<input id="apiKey" type="password" autocomplete="new-password" placeholder="已配置时留空可保留现有密钥"></label>
-      <label>模型名称<input id="modelName" value="claude-sonnet-4-6" placeholder="例如 claude-sonnet-4-6" required></label>
-      <label>兼容 API 地址 <span class="optional">选填</span><input id="baseUrl" type="url" placeholder="https://api.anthropic.com"></label>
-      <div id="settingsError" class="settings-error hidden"></div>
-      <div class="dialog-actions"><button type="button" id="cancelSettings" class="secondary-button">取消</button><button class="send-button" type="submit">保存并连接 <span>↗</span></button></div>
-    </form>
+    <section id="providerListView">
+      <p class="settings-description">管理已绑定的模型连接。密钥仅保存在本机。</p>
+      <div id="providerList" class="provider-list"></div>
+      <div class="dialog-actions"><button type="button" id="newProvider" class="send-button">＋ 添加连接</button></div>
+    </section>
+    <section id="providerEditView" class="hidden">
+      <p class="settings-description">配置 Anthropic 兼容服务，并添加可使用的具体模型 ID。</p>
+      <form id="settingsForm" class="settings-form">
+        <div class="settings-columns">
+          <div class="settings-column">
+            <label>连接名称<input id="providerName" placeholder="例如 MiniMax" required></label>
+            <div id="savedKey" class="saved-key hidden"><span>API Key 已保存</span><button id="changeKey" type="button" class="text-button">更换 API Key</button></div>
+            <label id="keyField">API Key<input id="apiKey" type="password" autocomplete="new-password" placeholder="输入 API Key"></label>
+            <label>兼容 API 地址 <span class="optional">选填</span><input id="baseUrl" type="url" placeholder="https://api.anthropic.com"></label>
+          </div>
+          <div class="settings-column">
+            <label>模型 ID（每行一个）<textarea id="modelNames" rows="5" placeholder="MiniMax-M3&#10;MiniMax-M2.7" required></textarea></label>
+            <label>测试型号<select id="testModel"></select></label>
+          </div>
+        </div>
+        <div id="settingsError" class="settings-error hidden" role="status"></div>
+        <div class="dialog-actions"><button type="button" id="cancelSettings" class="secondary-button">返回列表</button><button type="button" id="testProvider" class="secondary-button">测试连接</button><button class="send-button" type="submit">保存连接</button></div>
+      </form>
+    </section>
   </dialog>
   <script src="/assets/app.js" defer></script>
 </body>

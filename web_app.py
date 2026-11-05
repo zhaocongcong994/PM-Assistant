@@ -20,8 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from anthropic import Anthropic
-from dotenv import load_dotenv, set_key
+from anthropic import Anthropic, AuthenticationError, PermissionDeniedError, NotFoundError, BadRequestError, RateLimitError, APIConnectionError, APITimeoutError
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -29,6 +29,7 @@ STATE_DIR = ROOT / ".webapp"
 OUTPUT_DIR = STATE_DIR / "generated"
 STATE_PATH = STATE_DIR / "sessions.json"
 ENV_PATH = ROOT / ".env"
+MODELS_PATH = STATE_DIR / "models.json"
 HOST = "127.0.0.1"
 PORT = int(os.getenv("WEB_PORT", "8765"))
 load_dotenv(ENV_PATH, override=True)
@@ -282,20 +283,72 @@ def _invalidate_downstream(session: dict, phase: str) -> None:
         session["approvals"].pop(descendant, None)
 
 
-def _client() -> Anthropic:
-    load_dotenv(ENV_PATH, override=True)
-    key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not key or "xxx" in key.lower():
-        raise ValueError("请先在「模型设置」中填写有效的 API Key。")
-    kwargs = {"api_key": key}
-    if os.getenv("ANTHROPIC_BASE_URL"):
-        kwargs["base_url"] = os.environ["ANTHROPIC_BASE_URL"]
+def _save_models(data: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".models-", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        os.replace(name, MODELS_PATH)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def _read_models() -> dict:
+    with _lock:
+        if MODELS_PATH.exists():
+            data = json.loads(MODELS_PATH.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("providers"), list):
+                raise ValueError("模型配置文件格式无效。")
+            return data
+        load_dotenv(ENV_PATH, override=True)
+        key = os.getenv("ANTHROPIC_API_KEY", "")
+        model = os.getenv("MODEL_ID", "claude-sonnet-4-6")
+        providers = []
+        if key and "xxx" not in key.lower():
+            providers = [{"id": str(uuid.uuid4()), "name": "已有连接", "api_key": key,
+                          "base_url": os.getenv("ANTHROPIC_BASE_URL", ""), "models": [model]}]
+        data = {"providers": providers}
+        _save_models(data)
+        if providers:
+            state = _read_state()
+            changed = False
+            for session in state["sessions"]:
+                if "model_selection" not in session:
+                    session["model_selection"] = {"provider_id": providers[0]["id"], "model": model}
+                    changed = True
+            if changed:
+                _save_state(state)
+        return data
+
+
+def _public_models(data: dict) -> list:
+    return [{"id": p["id"], "name": p["name"], "base_url": p["base_url"],
+             "models": p["models"], "has_key": bool(p.get("api_key"))} for p in data["providers"]]
+
+
+def _resolve_model(selection: object, data: dict | None = None) -> dict:
+    if not isinstance(selection, dict):
+        raise ValueError("请先为项目选择已绑定的模型。")
+    provider = next((p for p in (data or _read_models())["providers"] if p["id"] == selection.get("provider_id")), None)
+    model = selection.get("model")
+    if not provider or model not in provider["models"] or not provider.get("api_key"):
+        raise ValueError("项目所选模型已不可用，请重新选择模型。")
+    return {"api_key": provider["api_key"], "base_url": provider["base_url"], "model": model}
+
+
+def _client(snapshot: dict | None = None) -> Anthropic:
+    if snapshot is None:
+        raise ValueError("请先选择模型。")
+    kwargs = {"api_key": snapshot["api_key"]}
+    if snapshot["base_url"]:
+        kwargs["base_url"] = snapshot["base_url"]
     return Anthropic(**kwargs)
 
 
-def _model() -> str:
-    load_dotenv(ENV_PATH, override=True)
-    return os.getenv("MODEL_ID", "claude-sonnet-4-6")
+def _model(snapshot: dict | None = None) -> str:
+    return snapshot["model"]
 
 
 def _write_files(session_id: str, files: list) -> list[str]:
@@ -376,14 +429,21 @@ def _complete_text_response(client: Anthropic, request_args: dict, response) -> 
     raise ValueError("模型输出未能完成，请重试。")
 
 
+def _apply_tool_compatibility(snapshot: dict | None, request_args: dict) -> None:
+    """DeepSeek requires thinking disabled when a specific tool is forced."""
+    host = (urlparse((snapshot or {}).get("base_url", "")).hostname or "").lower()
+    if host == "api.deepseek.com" and request_args.get("tool_choice", {}).get("type") == "tool":
+        request_args["thinking"] = {"type": "disabled"}
+
+
 def _run_job(operation_id: str, session_id: str, phase: str, prompt: str,
-             save_result: bool = True, task_mode: str = "phase") -> None:
+             save_result: bool = True, task_mode: str = "phase", snapshot: dict | None = None) -> None:
     try:
-        client = _client()
+        client = _client(snapshot)
         messages = [{"role": "user", "content": prompt}]
         artifacts = []
         request_args = dict(
-            model=_model(), max_tokens=12000,
+            model=_model(snapshot), max_tokens=12000,
             system=DISCOVERY_SYSTEM if task_mode == "discovery" else PROMPT,
             messages=messages,
         )
@@ -400,7 +460,18 @@ def _run_job(operation_id: str, session_id: str, phase: str, prompt: str,
                                "required": ["files"], "additionalProperties": False}}],
                 "tool_choice": {"type": "tool", "name": "save_files"},
             })
+        _apply_tool_compatibility(snapshot, request_args)
         response = client.messages.create(**request_args)
+        if task_mode == "discovery" and response.stop_reason != "max_tokens":
+            def has_discovery_reply(result) -> bool:
+                return any(getattr(block, "type", "") == "tool_use"
+                           and getattr(block, "name", "") == "discovery_update"
+                           and isinstance(getattr(block, "input", None), dict)
+                           and isinstance(block.input.get("assistant_message"), str)
+                           and block.input["assistant_message"].strip()
+                           for block in result.content)
+            if not has_discovery_reply(response):
+                response = client.messages.create(**request_args)
         if response.stop_reason == "max_tokens" and (task_mode == "discovery" or phase in ("frontend", "backend")):
             raise ValueError("模型输出达到长度上限，结构化结果尚未完整。请缩小本轮范围后重试。")
         text = _complete_text_response(client, request_args, response)
@@ -453,11 +524,11 @@ def _run_job(operation_id: str, session_id: str, phase: str, prompt: str,
                 _save_state(state)
 
 
-def _continue_job(operation_id: str, session_id: str, phase: str, partial: str, last_user: str) -> None:
+def _continue_job(operation_id: str, session_id: str, phase: str, partial: str, last_user: str, snapshot: dict | None = None) -> None:
     try:
-        client = _client()
+        client = _client(snapshot)
         request_args = {
-            "model": _model(), "max_tokens": 12000, "system": PROMPT,
+            "model": _model(snapshot), "max_tokens": 12000, "system": PROMPT,
             "messages": [
                 {"role": "user", "content": _phase_context_for_id(session_id, phase) + "\n用户补充：" + last_user},
                 {"role": "assistant", "content": partial},
@@ -571,10 +642,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             return self.wfile.write(data)
-        if parsed.path == "/api/health":
-            load_dotenv(ENV_PATH, override=True)
-            key = os.getenv("ANTHROPIC_API_KEY", "")
-            return self._json(200, {"configured": bool(key and "xxx" not in key.lower()), "model": _model(), "base_url": os.getenv("ANTHROPIC_BASE_URL", "")})
+        if parsed.path in ("/api/health", "/api/models"):
+            providers = _public_models(_read_models())
+            return self._json(200, {"configured": any(p["models"] and p["has_key"] for p in providers), "providers": providers})
         if parsed.path == "/api/sessions":
             with _lock:
                 return self._json(200, {"sessions": [_public_session(s) for s in _read_state()["sessions"]]})
@@ -620,41 +690,89 @@ class Handler(BaseHTTPRequestHandler):
                 if origin_url.scheme != "http" or origin_url.hostname not in ("127.0.0.1", "localhost") or origin_url.port != PORT:
                     return self._json(403, {"error": "仅接受本地工作台的请求。"})
             body = self._body()
-            if self.path == "/api/config":
-                raw_key = body.get("api_key", "")
-                if not isinstance(raw_key, str) or not isinstance(body.get("model", ""), str):
-                    return self._json(400, {"error": "模型配置格式无效，请检查输入。"})
-                key = raw_key.strip()
-                model = body["model"].strip()
-                if key and (len(key) < 8 or any(ord(char) < 32 for char in key)):
-                    return self._json(400, {"error": "API Key 格式无效。"})
-                if any(ord(char) < 32 for char in key) or not model or len(model) > 128 or any(ord(char) < 32 for char in model):
-                    return self._json(400, {"error": "模型配置格式无效，请检查输入。"})
-                load_dotenv(ENV_PATH, override=True)
-                if not key:
-                    key = os.getenv("ANTHROPIC_API_KEY", "")
-                if not key or "xxx" in key.lower():
-                    return self._json(400, {"error": "请填写有效的 API Key。"})
-                ENV_PATH.touch(exist_ok=True)
-                if raw_key.strip():
-                    set_key(str(ENV_PATH), "ANTHROPIC_API_KEY", key)
-                set_key(str(ENV_PATH), "MODEL_ID", model)
-                base_url = str(body.get("base_url", "")).strip()
+            if self.path == "/api/models":
+                with _lock:
+                    data = _read_models()
+                    provider_id = body.get("id", "")
+                    old = next((p for p in data["providers"] if p["id"] == provider_id), None)
+                    if provider_id and old is None:
+                        raise ValueError("连接不存在，请刷新后重试。")
+                    name, base_url, key, models = body.get("name"), body.get("base_url", ""), body.get("api_key", ""), body.get("models")
+                    if not all(isinstance(x, str) for x in (name, base_url, key)) or not isinstance(models, list) or not all(isinstance(x, str) for x in models):
+                        raise ValueError("连接配置格式无效。")
+                    name, base_url, key = name.strip(), base_url.strip(), key.strip()
+                    models = list(dict.fromkeys(x.strip() for x in models if x.strip()))
+                    if not name or len(name) > 80 or not models or any(len(x) > 128 or any(ord(c) < 32 for c in x) for x in models):
+                        raise ValueError("请输入连接名称和至少一个有效的模型 ID。")
+                    if base_url:
+                        parsed_url = urlparse(base_url)
+                        if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname or parsed_url.username or parsed_url.password or any(ord(c) < 32 for c in base_url):
+                            raise ValueError("兼容 API 地址格式无效。")
+                    key = key or (old.get("api_key", "") if old else "")
+                    if len(key) < 8 or any(ord(c) < 32 for c in key) or "xxx" in key.lower():
+                        raise ValueError("请填写有效的 API Key。")
+                    item = {"id": provider_id or str(uuid.uuid4()), "name": name, "base_url": base_url, "api_key": key, "models": models}
+                    if old:
+                        data["providers"][data["providers"].index(old)] = item
+                    else:
+                        data["providers"].append(item)
+                    _save_models(data)
+                    return self._json(200, {"providers": _public_models(data)})
+            match = re.fullmatch(r"/api/models/([a-f0-9-]+)/delete", self.path)
+            if match:
+                with _lock:
+                    data = _read_models()
+                    if not any(p["id"] == match.group(1) for p in data["providers"]):
+                        raise ValueError("连接不存在。")
+                    data["providers"] = [p for p in data["providers"] if p["id"] != match.group(1)]
+                    _save_models(data)
+                return self._json(200, {"providers": _public_models(data)})
+            if self.path == "/api/models/test":
+                provider_id, key, base_url, model = (body.get("id", ""), body.get("api_key", ""),
+                                                     body.get("base_url", ""), body.get("model", ""))
+                if not all(isinstance(v, str) for v in (provider_id, key, base_url, model)):
+                    raise ValueError("测试配置格式无效。")
+                key, base_url, model = key.strip(), base_url.strip(), model.strip()
+                if provider_id:
+                    with _lock:
+                        old = next((p for p in _read_models()["providers"] if p["id"] == provider_id), None)
+                        if not old:
+                            raise ValueError("连接不存在，请刷新后重试。")
+                        key = key or old.get("api_key", "")
+                if len(key) < 8 or any(ord(c) < 32 for c in key) or "xxx" in key.lower():
+                    raise ValueError("请填写有效的 API Key。")
+                if not model or len(model) > 128 or any(ord(c) < 32 for c in model):
+                    raise ValueError("请选择要测试的模型 ID。")
                 if base_url:
                     parsed_url = urlparse(base_url)
-                    if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname or parsed_url.username or parsed_url.password or any(ord(char) < 32 for char in base_url):
-                        return self._json(400, {"error": "兼容 API 地址格式无效。"})
-                    set_key(str(ENV_PATH), "ANTHROPIC_BASE_URL", base_url)
-                else:
-                    from dotenv import unset_key
-                    unset_key(str(ENV_PATH), "ANTHROPIC_BASE_URL")
-                os.environ["ANTHROPIC_API_KEY"] = key
-                os.environ["MODEL_ID"] = model
-                if base_url:
-                    os.environ["ANTHROPIC_BASE_URL"] = base_url
-                else:
-                    os.environ.pop("ANTHROPIC_BASE_URL", None)
-                return self._json(200, {"configured": True, "model": model})
+                    if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname or parsed_url.username or parsed_url.password or any(ord(c) < 32 for c in base_url):
+                        raise ValueError("兼容 API 地址格式无效。")
+                snapshot = {"api_key": key, "base_url": base_url, "model": model}
+                try:
+                    _client(snapshot).with_options(timeout=30, max_retries=0).messages.create(model=model, max_tokens=16, messages=[{"role": "user", "content": "Reply OK."}])
+                except (AuthenticationError, PermissionDeniedError):
+                    return self._json(400, {"error": "认证失败或账号无权使用此模型，请检查密钥和账号权限。"})
+                except (NotFoundError, BadRequestError):
+                    return self._json(400, {"error": "服务未接受请求，请检查 API 地址和模型 ID。"})
+                except RateLimitError:
+                    return self._json(400, {"error": "请求受到限制，请检查额度或稍后重试。"})
+                except (APIConnectionError, APITimeoutError):
+                    return self._json(400, {"error": "无法连接模型服务或请求超时，请检查地址和网络。"})
+                except Exception:
+                    return self._json(400, {"error": "连接测试失败，请检查模型 ID、API 地址、密钥及账号权限。"})
+                return self._json(200, {"ok": True})
+            match = re.fullmatch(r"/api/sessions/([a-f0-9-]+)/model", self.path)
+            if match:
+                with _lock:
+                    selection = body.get("selection")
+                    _resolve_model(selection)
+                    state = _read_state()
+                    session = _find_session(state, match.group(1))
+                    if not session:
+                        return self._json(404, {"error": "项目不存在。"})
+                    session["model_selection"] = {"provider_id": selection["provider_id"], "model": selection["model"]}
+                    _save_state(state)
+                    return self._json(200, {"session": session})
             if self.path == "/api/import/feishu":
                 url = _valid_feishu_doc_url(body.get("url"))
                 if not url:
@@ -733,8 +851,10 @@ class Handler(BaseHTTPRequestHandler):
                 entry_mode = body.get("entry_mode", "idea")
                 if entry_mode not in ("idea", "prd"):
                     return self._json(400, {"error": "需求入口类型无效。"})
+                selection = body.get("model_selection")
+                _resolve_model(selection)
                 session_id = str(uuid.uuid4())
-                session = {"id": session_id, "title": (brief[:38] or "新建产品项目"), "brief": brief,
+                session = {"model_selection": {"provider_id": selection["provider_id"], "model": selection["model"]}, "id": session_id, "title": (brief[:38] or "新建产品项目"), "brief": brief,
                            "phase": "brief", "status": "ready", "generation_scope": "fullstack",
                            "entry_mode": entry_mode, "discovery": _new_discovery(entry_mode),
                            "selected_components": [], "approvals": {}, "phase_results": {},
@@ -790,6 +910,7 @@ class Handler(BaseHTTPRequestHandler):
                     session = _find_session(state, session_id)
                     if not session:
                         return self._json(404, {"error": "项目不存在。"})
+                    snapshot = _resolve_model(session.get("model_selection"))
                     discovery = session.setdefault("discovery", _new_discovery(session.get("entry_mode", "idea")))
                     if session["status"] == "running":
                         return self._json(409, {"error": "当前任务仍在运行。"})
@@ -803,7 +924,7 @@ class Handler(BaseHTTPRequestHandler):
                 operation_id = str(uuid.uuid4())
                 with _lock:
                     _operations[operation_id] = {"id": operation_id, "status": "running"}
-                threading.Thread(target=_run_job, args=(operation_id, session_id, "brief", prompt, False, "discovery"), daemon=True).start()
+                threading.Thread(target=_run_job, args=(operation_id, session_id, "brief", prompt, False, "discovery", snapshot), daemon=True).start()
                 return self._json(202, {"job_id": operation_id})
             if self.path == "/api/discovery/draft":
                 session_id = str(body.get("session_id", ""))
@@ -862,6 +983,7 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json(404, {"error": "项目不存在。"})
                     if session["status"] == "running":
                         return self._json(409, {"error": "当前任务仍在运行，请等待完成。"})
+                    snapshot = _resolve_model(session.get("model_selection"))
                     is_discovery = session.get("phase") == "brief"
                     if is_discovery:
                         _invalidate_downstream(session, "brief")
@@ -883,7 +1005,7 @@ class Handler(BaseHTTPRequestHandler):
                 operation_id = str(uuid.uuid4())
                 with _lock:
                     _operations[operation_id] = {"id": operation_id, "status": "running"}
-                threading.Thread(target=_run_job, args=(operation_id, session_id, phase, prompt, False, task_mode), daemon=True).start()
+                threading.Thread(target=_run_job, args=(operation_id, session_id, phase, prompt, False, task_mode, snapshot), daemon=True).start()
                 return self._json(202, {"job_id": operation_id})
             if self.path == "/api/continue":
                 session_id = str(body.get("session_id", ""))
@@ -894,6 +1016,7 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json(404, {"error": "项目不存在。"})
                     if session["status"] == "running":
                         return self._json(409, {"error": "当前已有任务运行中。"})
+                    snapshot = _resolve_model(session.get("model_selection"))
                     messages = session.get("messages", [])
                     if session["phase"] == "brief" or not messages or messages[-1].get("role") != "assistant":
                         return self._json(409, {"error": "当前没有可续写的阶段回复。"})
@@ -905,7 +1028,7 @@ class Handler(BaseHTTPRequestHandler):
                 operation_id = str(uuid.uuid4())
                 with _lock:
                     _operations[operation_id] = {"id": operation_id, "status": "running"}
-                threading.Thread(target=_continue_job, args=(operation_id, session_id, phase, partial, last_user), daemon=True).start()
+                threading.Thread(target=_continue_job, args=(operation_id, session_id, phase, partial, last_user, snapshot), daemon=True).start()
                 return self._json(202, {"job_id": operation_id})
             if self.path == "/api/run":
                 session_id, phase = str(body.get("session_id", "")), str(body.get("phase", ""))
@@ -918,6 +1041,7 @@ class Handler(BaseHTTPRequestHandler):
                     session = _find_session(state, session_id)
                     if not session:
                         return self._json(404, {"error": "项目不存在。"})
+                    snapshot = _resolve_model(session.get("model_selection"))
                     gates = {"components": "brief", "architecture": "components", "development": "architecture", "ui_design": "development", "frontend": "ui_design", "backend": "development", "verification": "development"}
                     gate = gates.get(phase)
                     if gate and not session["approvals"].get(gate):
@@ -941,7 +1065,7 @@ class Handler(BaseHTTPRequestHandler):
                 operation_id = str(uuid.uuid4())
                 with _lock:
                     _operations[operation_id] = {"id": operation_id, "status": "running"}
-                threading.Thread(target=_run_job, args=(operation_id, session_id, phase, context), daemon=True).start()
+                threading.Thread(target=_run_job, args=(operation_id, session_id, phase, context, True, "phase", snapshot), daemon=True).start()
                 return self._json(202, {"job_id": operation_id})
             if self.path == "/api/review":
                 session_id, phase = str(body.get("session_id", "")), str(body.get("phase", ""))

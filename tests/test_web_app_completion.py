@@ -58,3 +58,51 @@ class CompletionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_deepseek_forced_tool_requests_disable_thinking():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        snapshot = {'model': 'deepseek-flash', 'base_url': 'https://api.deepseek.com/anthropic', 'api_key': 'test-key'}
+        for phase, task_mode, tool_name in [('brief', 'discovery', 'discovery_update'), ('frontend', 'phase', 'save_files')]:
+            client = FakeClient([response('text', 'end_turn')])
+            operation = f'test-{phase}'
+            with patch.object(web_app, 'STATE_DIR', root), patch.object(web_app, 'STATE_PATH', root / 'sessions.json'), patch.object(web_app, 'OUTPUT_DIR', root / 'generated'), patch.object(web_app, '_client', return_value=client):
+                web_app._save_state({'sessions': [{'id': 'session', 'status': 'running', 'messages': [], 'phase_results': {}}]})
+                web_app._operations[operation] = {'status': 'running'}
+                try:
+                    web_app._run_job(operation, 'session', phase, 'test', phase != 'brief', task_mode, snapshot)
+                    assert client.calls[0]['tool_choice'] == {'type': 'tool', 'name': tool_name}
+                    assert client.calls[0]['thinking'] == {'type': 'disabled'}
+                finally:
+                    del web_app._operations[operation]
+
+
+def test_compatibility_does_not_change_other_providers_or_plain_requests():
+    forced = {'tool_choice': {'type': 'tool', 'name': 'discovery_update'}}
+    web_app._apply_tool_compatibility({'base_url': 'https://api.minimaxi.com/anthropic'}, forced)
+    assert 'thinking' not in forced
+    plain = {}
+    web_app._apply_tool_compatibility({'base_url': 'https://api.deepseek.com/anthropic'}, plain)
+    assert 'thinking' not in plain
+
+
+def test_discovery_retries_once_when_tool_reply_is_empty():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        def tool(message):
+            payload = {'assistant_message': message, 'stage': 'direction', 'facts': [], 'open_questions': ['谁使用？'], 'ready_for_draft': False}
+            return SimpleNamespace(content=[SimpleNamespace(type='tool_use', name='discovery_update', input=payload)], stop_reason='tool_use')
+        client = FakeClient([tool(''), tool('谁会使用这个工具？')])
+        snapshot = {'model': 'deepseek-flash', 'base_url': 'https://api.deepseek.com/anthropic', 'api_key': 'test-key'}
+        with patch.object(web_app, 'STATE_DIR', root), patch.object(web_app, 'STATE_PATH', root / 'sessions.json'), patch.object(web_app, '_client', return_value=client):
+            web_app._save_state({'sessions': [{'id': 'session', 'status': 'running', 'messages': [], 'phase_results': {}}]})
+            web_app._operations['retry-test'] = {'status': 'running'}
+            try:
+                web_app._run_job('retry-test', 'session', 'brief', 'test', False, 'discovery', snapshot)
+                session = web_app._find_session(web_app._read_state(), 'session')
+                assert len(client.calls) == 2
+                assert session['messages'][-1]['content'] == '谁会使用这个工具？'
+                assert web_app._operations['retry-test']['status'] == 'completed'
+            finally:
+                del web_app._operations['retry-test']

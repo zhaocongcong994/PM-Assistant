@@ -36,7 +36,9 @@ const componentOptions = [
   ['workflow','工作流运行时','流程固定，需跟踪或恢复'],
 ];
 let session = null;
-let config = {configured:false,model:'claude-sonnet-4-6'};
+let config = {configured:false,providers:[]};
+let draftModel = null;
+let editingProviderId = '';
 let activeDeliverable = 'requirements';
 let pendingJob = null;
 let sessions = [];
@@ -58,11 +60,21 @@ async function request(path, options={}) {
   if (!response.ok) {const error=new Error(data.error||`请求失败 (${response.status})`);error.authRequired=Boolean(data.auth_required);throw error;}
   return data;
 }
+function modelValue(selection) {return selection ? `${encodeURIComponent(selection.provider_id)}|${encodeURIComponent(selection.model)}` : '';}
+function parseModel(value) {if(!value)return null;const [provider_id,model]=value.split('|').map(decodeURIComponent);return {provider_id,model};}
+function renderModelSelector() {
+  const selected=session ? session.model_selection : draftModel;
+  const value=modelValue(selected);
+  let options='<option value="">请选择模型</option>';
+  for(const p of config.providers||[]) options+=`<optgroup label="${escapeHtml(p.name)}">${p.models.map(m=>`<option value="${escapeHtml(modelValue({provider_id:p.id,model:m}))}">${escapeHtml(m)}</option>`).join('')}</optgroup>`;
+  $('modelBadge').innerHTML=options;
+  $('modelBadge').value=value;
+  if(value&&!$('modelBadge').value){$('modelBadge').value='';if(!session)draftModel=null;}
+}
 async function refreshHealth() {
   try { config=await request('/api/health'); }
-  catch { config={configured:false,model:'未连接'}; }
-  $('modelBadge').innerHTML=`<span class="status-dot"></span>${config.configured?escapeHtml(config.model):'模型未配置'}`;
-  $('modelBadge').classList.toggle('connected',config.configured);
+  catch { config={configured:false,providers:[]}; }
+  renderModelSelector();
   $('configDot').classList.toggle('configured',config.configured);
 }
 async function refreshSessions() {
@@ -231,10 +243,11 @@ function renderRight() {
 function renderWorkspace() {
   const has=Boolean(session);
   $('welcome').classList.toggle('hidden',has); $('workspace').classList.toggle('hidden',!has);
-  if(!has)return;
+  if(!has){$('projectTitle').textContent='新建项目';renderModelSelector();return;}
   if(rightPanelPreferredWidth!==null)applyRightPanelWidth(rightPanelPreferredWidth);
   else updateSplitterAria();
   $('projectTitle').textContent=session.title||'新建项目';
+  renderModelSelector();
   const phase=phases.find(p=>p.id===session.phase)||phases[0]; const index=currentIndex();
   $('phaseKicker').textContent=`阶段 ${String(index+1).padStart(2,'0')} / ${phases.length}`;
   $('phaseTitle').textContent=phase.label; $('phaseIntro').textContent=phase.intro;
@@ -252,9 +265,10 @@ async function openSession(id) {
 }
 function showError(message) { $('errorBanner').textContent=message;$('errorBanner').classList.remove('hidden'); }
 async function createProject(brief) {
-  if(!config.configured){$('settingsDialog').showModal();return;}
+  if(!config.configured){openModelSettings();return;}
+  if(!draftModel){alert('请先在右上角选择本项目使用的模型。');$('modelBadge').focus();return;}
   try {
-    const data=await request('/api/sessions',{method:'POST',body:JSON.stringify({brief,entry_mode:entryMode})});
+    const data=await request('/api/sessions',{method:'POST',body:JSON.stringify({brief,entry_mode:entryMode,model_selection:draftModel})});
     session=data.session;activeDeliverable='requirements';renderWorkspace();
     await startDiscovery();
   } catch(e){showError(e.message)}
@@ -295,7 +309,7 @@ async function pollJob(jobId) {
 }
 async function runPhase(phase) {
   if(!session)return;
-  if(!config.configured){$('settingsDialog').showModal();return;}
+  if(!config.configured){openModelSettings();return;}
   try {
     session.phase=phase;session.status='running';session.error='';renderWorkspace();
     const data=await request('/api/run',{method:'POST',body:JSON.stringify({session_id:session.id,phase})});
@@ -323,7 +337,7 @@ function changePhase(phase) {
 }
 async function sendChat() {
   const message=$('chatInput').value.trim();if(!message||!session)return;
-  if(!config.configured){$('settingsDialog').showModal();return;}
+  if(!config.configured){openModelSettings();return;}
   try {
     session.messages.push({role:'user',content:message});session.status='running';session.error='';$('chatInput').value='';renderWorkspace();
     const data=await request('/api/chat',{method:'POST',body:JSON.stringify({session_id:session.id,message})});
@@ -332,20 +346,46 @@ async function sendChat() {
 }
 async function continueAnswer() {
   if(!session)return;
-  if(!config.configured){$('settingsDialog').showModal();return;}
+  if(!config.configured){openModelSettings();return;}
   try {
     session.status='running';session.error='';renderWorkspace();
     const data=await request('/api/continue',{method:'POST',body:JSON.stringify({session_id:session.id})});
     await pollJob(data.job_id);
   } catch(e){session.status='ready';session.error=e.message;renderWorkspace()}
 }
+function showSettingsMessage(message, error=true) {$('settingsError').textContent=message;$('settingsError').classList.toggle('hidden',!message);$('settingsError').classList.toggle('success',!error);}
+function modelNames() {return [...new Set($('modelNames').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))];}
+function refreshTestModels() {
+  const previous=$('testModel').value, models=modelNames();
+  $('testModel').innerHTML=models.length?models.map(m=>`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join(''):'<option value="">请先填写模型 ID</option>';
+  if(models.includes(previous))$('testModel').value=previous;
+}
+function showProviderList() {
+  editingProviderId='';$('apiKey').value='';showSettingsMessage('');
+  $('providerListView').classList.remove('hidden');$('providerEditView').classList.add('hidden');
+  const providers=config.providers||[];
+  $('providerList').innerHTML=providers.length?providers.map(p=>`<article class="provider-row"><div class="provider-info"><strong>${escapeHtml(p.name)}</strong><span>${p.models.map(escapeHtml).join(' · ')}</span></div><div class="provider-actions"><button type="button" class="secondary-button" data-edit-provider="${escapeHtml(p.id)}">编辑</button><button type="button" class="secondary-button" data-delete-provider="${escapeHtml(p.id)}">删除</button></div></article>`).join(''):'<div class="provider-empty">尚未添加模型连接，请先添加。</div>';
+  $('providerList').querySelectorAll('[data-edit-provider]').forEach(el=>el.addEventListener('click',()=>editProvider(el.dataset.editProvider)));
+  $('providerList').querySelectorAll('[data-delete-provider]').forEach(el=>el.addEventListener('click',()=>deleteProvider(el.dataset.deleteProvider)));
+}
+function editProvider(id='') {
+  editingProviderId=id;
+  const p=(config.providers||[]).find(item=>item.id===id);
+  $('providerListView').classList.add('hidden');$('providerEditView').classList.remove('hidden');
+  $('providerName').value=p?.name||'';$('baseUrl').value=p?.base_url||'';$('modelNames').value=(p?.models||[]).join('\n');$('apiKey').value='';
+  $('savedKey').classList.toggle('hidden',!p?.has_key);$('keyField').classList.toggle('hidden',!!p?.has_key);
+  refreshTestModels();showSettingsMessage('');
+}
 async function setupSettings() {
-  $('settingsError').classList.add('hidden');
   try {
-    const result=await request('/api/config',{method:'POST',body:JSON.stringify({api_key:$('apiKey').value,model:$('modelName').value,base_url:$('baseUrl').value})});
-    config={configured:true,model:result.model};$('apiKey').value='';$('settingsDialog').close();await refreshHealth();
-    if(!session&&$('briefInput').value.trim())createProject($('briefInput').value.trim());
-  } catch(e){$('settingsError').textContent=e.message;$('settingsError').classList.remove('hidden')}
+    await request('/api/models',{method:'POST',body:JSON.stringify({id:editingProviderId,name:$('providerName').value,api_key:$('apiKey').value,base_url:$('baseUrl').value,models:modelNames()})});
+    await refreshHealth();showProviderList();
+  } catch(e){showSettingsMessage(e.message)}
+}
+async function deleteProvider(id) {
+  if(!confirm('删除此连接？使用该连接的项目需要重新选择模型。'))return;
+  try {await request(`/api/models/${encodeURIComponent(id)}/delete`,{method:'POST',body:'{}'});await refreshHealth();showProviderList();}
+  catch(e){alert(e.message)}
 }
 function resetNewProjectForm() {
   feishuImportGeneration++;
@@ -446,7 +486,7 @@ async function startProjectFromWelcome() {
   }
   createProject(brief);
 }
-$('newProject').addEventListener('click',()=>{session=null;pendingJob=null;activeDeliverable='requirements';resetNewProjectForm();renderWorkspace();$('briefInput').focus()});
+$('newProject').addEventListener('click',()=>{session=null;draftModel=null;renderModelSelector();pendingJob=null;activeDeliverable='requirements';resetNewProjectForm();renderWorkspace();$('briefInput').focus()});
 $('startProject').addEventListener('click',startProjectFromWelcome);
 $('loadFeishuPrd').addEventListener('click',loadFeishuPrd);
 $('connectFeishu').addEventListener('click',startFeishuAuth);
@@ -477,11 +517,26 @@ $('briefFile').addEventListener('change',async e=>{
 });
 $('sendMessage').addEventListener('click',sendChat);
 $('chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat()}});
-function openModelSettings(){$('modelName').value=config.model||'claude-sonnet-4-6';$('baseUrl').value=config.base_url||'';$('settingsDialog').showModal()}
+function openModelSettings(){showProviderList();$('settingsDialog').showModal()}
 $('openSettings').addEventListener('click',openModelSettings);
-$('modelBadge').addEventListener('click',openModelSettings);
+$('modelBadge').addEventListener('change',async e=>{
+  const selection=parseModel(e.target.value);
+  if(!selection)return;
+  if(!session){draftModel=selection;return;}
+  try {const data=await request(`/api/sessions/${encodeURIComponent(session.id)}/model`,{method:'POST',body:JSON.stringify({selection})});session=data.session;renderWorkspace();}
+  catch(error){showError(error.message);renderModelSelector();}
+});
+$('newProvider').addEventListener('click',()=>editProvider(''));
+$('changeKey').addEventListener('click',()=>{$('savedKey').classList.add('hidden');$('keyField').classList.remove('hidden');$('apiKey').focus()});
+$('modelNames').addEventListener('input',refreshTestModels);
+$('testProvider').addEventListener('click',async()=>{
+  const model=$('testModel').value;
+  if(!model){showSettingsMessage('请先填写并选择要测试的模型 ID。');return;}
+  $('testProvider').disabled=true;showSettingsMessage('正在测试连接…',false);
+  try {await request('/api/models/test',{method:'POST',body:JSON.stringify({id:editingProviderId,api_key:$('apiKey').value,base_url:$('baseUrl').value,model})});showSettingsMessage(`${model} 连接成功。`,false)}catch(e){showSettingsMessage(e.message)}finally{$('testProvider').disabled=false}
+});
 $('mobileProjectSelect').addEventListener('change',e=>{if(e.target.value)openSession(e.target.value)});
-$('cancelSettings').addEventListener('click',()=>$('settingsDialog').close());
+$('cancelSettings').addEventListener('click',showProviderList);
 $('settingsForm').addEventListener('submit',e=>{e.preventDefault();setupSettings()});
 $('stopWait').addEventListener('click',()=>{$('runningBanner').classList.add('hidden')});
 const rightPanelStorageKey='blueprint:rightPanelWidth';
