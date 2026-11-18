@@ -7,6 +7,7 @@
   <title>Nexus — 帮你把灵感落地</title>
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/teardown.css">
 </head>
 <body>
   <div class="app-shell">
@@ -25,9 +26,66 @@
 
     <main class="main-area">
       <header class="topbar">
-        <div class="breadcrumb"><span>项目工作区</span><span class="crumb-sep">/</span><strong id="projectTitle">新建项目</strong></div>
-        <div class="top-actions"><select id="mobileProjectSelect" class="mobile-project-select" aria-label="切换项目"><option value="">项目列表</option></select><select id="modelBadge" class="model-badge" aria-label="选择当前项目使用的模型"></select><button class="avatar" title="本地工作台">N</button></div>
+        <nav class="workbench-nav" aria-label="工作台">
+          <a id="projectTab" href="#project" aria-current="page">项目工作区</a>
+          <a id="teardownTab" href="#teardown">产品拆解</a>
+        </nav>
+        <div id="projectTopActions" class="top-actions"><strong id="projectTitle" class="top-project-title">新建项目</strong><select id="mobileProjectSelect" class="mobile-project-select" aria-label="切换项目"><option value="">项目列表</option></select><select id="modelBadge" class="model-badge" aria-label="选择当前项目使用的模型"></select><button class="avatar" title="本地工作台">N</button></div>
       </header>
+
+      <section id="teardown" class="teardown-view hidden" aria-labelledby="teardownTitle">
+        <div class="teardown-heading">
+          <div><h1 id="teardownTitle">产品拆解</h1><p>用操作截图梳理用户旅程、Agent 分工和产品架构。</p></div>
+          <div class="teardown-history">
+            <select id="teardownHistory" class="hidden" aria-label="新建或切换拆解"></select>
+          </div>
+        </div>
+        <div id="teardownNotice" class="error-banner hidden" role="alert"></div>
+
+        <form id="teardownForm" class="teardown-card">
+          <div class="teardown-fields">
+            <label>产品名称<input id="teardownName" maxlength="80" required></label>
+            <label>分析模型<select id="teardownModel" required></select></label>
+          </div>
+          <div class="teardown-picker">
+            <div><strong>操作截图</strong>
+              <p>可选单图或 ZIP。单图最多 50 张，每张最多 10 MiB，总计 100 MiB。ZIP 限 1 个，最多 100 MiB、100 张图。</p>
+              <p>支持 JPG、PNG、WebP、GIF、HEIC、AVIF、BMP、TIFF 等常见格式。</p>
+              <p id="teardownDraftStatus" class="teardown-draft-status" aria-live="polite"></p>
+            </div>
+            <div class="teardown-upload-actions">
+              <button id="teardownAddFiles" class="secondary-button teardown-file-button" type="button">添加截图</button>
+              <button id="teardownAddArchive" class="secondary-button teardown-file-button" type="button">上传 ZIP</button>
+              <input id="teardownFiles" type="file" multiple hidden
+                accept=".png,.apng,.jpg,.jpeg,.jpe,.jfif,.webp,.gif,.bmp,.dib,.tif,.tiff,.ico,.avif,.heic,.heif,.jp2,.j2k">
+              <input id="teardownArchive" type="file" accept=".zip,application/zip" hidden>
+            </div>
+          </div>
+          <div class="teardown-draft-header"><button id="teardownClearFiles" class="text-button hidden" type="button">清空已选文件</button></div>
+          <ol id="teardownDraftFiles" class="teardown-draft-files"></ol>
+          <div class="teardown-form-footer">
+            <p>截图将由你选择的模型服务处理。</p>
+            <button id="teardownStart" class="send-button" type="submit">开始拆解</button>
+          </div>
+        </form>
+        <div id="teardownRun" class="hidden"></div>
+      </section>
+
+      <dialog id="teardownImageDialog" class="teardown-image-dialog">
+        <form method="dialog"><strong id="teardownImageTitle">截图</strong><button class="icon-button" aria-label="关闭截图">×</button></form>
+        <img id="teardownImage" alt="">
+      </dialog>
+
+      <dialog id="teardownImportDialog" class="settings-dialog teardown-import-dialog"
+        aria-labelledby="teardownImportTitle" aria-describedby="teardownImportDescription">
+        <h2 id="teardownImportTitle">将拆解结果带入项目工作区？</h2>
+        <p id="teardownImportDescription">确认后，将新建「<span id="teardownImportProjectName"></span>」项目，导入全部五阶段分析报告及关联截图证据，并打开新项目。</p>
+        <div id="teardownImportError" class="settings-error hidden" role="alert"></div>
+        <form method="dialog" class="dialog-actions">
+          <button id="teardownImportCancel" type="submit" value="cancel" class="secondary-button" autofocus>取消</button>
+          <button id="teardownImportConfirm" type="button" class="send-button">确认</button>
+        </form>
+      </dialog>
 
       <section id="welcome" class="welcome-view">
         <div class="welcome-content">
@@ -116,5 +174,6 @@
     </section>
   </dialog>
   <script src="/assets/app.js" defer></script>
+  <script src="/assets/teardown.js" defer></script>
 </body>
 </html>

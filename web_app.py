@@ -18,10 +18,12 @@ import zipfile
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from anthropic import Anthropic, AuthenticationError, PermissionDeniedError, NotFoundError, BadRequestError, RateLimitError, APIConnectionError, APITimeoutError
 from dotenv import load_dotenv
+from product_teardown import RUN_ID_PATTERN, TeardownService, project_draft, project_title
+from teardown_upload import MAX_LEGACY_REQUEST_BYTES, TeardownError, parse_upload
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -192,6 +194,20 @@ def _new_discovery(entry_mode: str) -> dict:
             "facts": {}, "open_questions": [], "can_draft": False, "draft_version": 0, "started": False}
 
 
+def _new_project_session(brief: str, entry_mode: str, selection: dict | None, *, title: str = "",
+                         reference_only: bool = False) -> dict:
+    now = _now()
+    return {
+        "id": str(uuid.uuid4()), "title": title or brief[:38] or "新建产品项目", "brief": brief,
+        "model_selection": {"provider_id": selection["provider_id"], "model": selection["model"]} if selection else None,
+        "phase": "brief", "status": "ready", "generation_scope": "fullstack",
+        "entry_mode": entry_mode, "discovery": _new_discovery(entry_mode),
+        "selected_components": [], "approvals": {}, "phase_results": {},
+        "messages": [{"role": "user", "content": brief, "created_at": now}] if brief and not reference_only else [],
+        "error": "", "created_at": now, "updated_at": now,
+    }
+
+
 def _discovery_context(session: dict) -> str:
     discovery = session.get("discovery") or _new_discovery(session.get("entry_mode", "idea"))
     facts = discovery.get("facts", {})
@@ -203,6 +219,11 @@ def _discovery_context(session: dict) -> str:
                         if mode == "prd" else "用户只有模糊想法：通过对话逐步明确需求，绝不能把场景选择文字当成产品需求。")
     transcript = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}"
                             for m in session.get("messages", [])[-30:])
+    imported = session.get("teardown_import")
+    if imported:
+        mode_instruction = "用户导入了产品拆解参考资料：先问用户希望把哪些发现用于本项目。"
+    reference = (f'产品拆解参考资料，须经用户确认后才可作为本项目需求：\n{imported["draft"]}\n'
+                 if imported else "")
     return (f"当前阶段：需求访谈；入口模式：{mode}（{mode_instruction}）\n"
             f"当前访谈环节：{discovery.get('stage', 'direction')}\n"
             f"已从用户表达中整理的信息：\n" + ("\n".join(fact_lines) or "（尚无已确认信息）") + "\n"
@@ -210,7 +231,7 @@ def _discovery_context(session: dict) -> str:
             f"当前待确认问题：{'；'.join(discovery.get('open_questions', [])) or '无'}\n"
             "你正在做产品访谈，不是在设计方案或编写 PRD。每轮先简短复述理解，再问 1 个主要问题，最多附 1 个相关追问。按方向、价值、流程、范围、约束逐步推进；用户答不上来时给通俗例子或选择建议，并保留待确认。不得假装用户已决定，不得生成完整需求文档，不得建议 Agent 组件、架构或技术方案。\n"
             "必须调用 discovery_update 工具返回本轮内容。facts 只填写从用户消息逐字引用得到的事实，每项提供可在用户原消息中找到的 evidence 原文；不能把你的建议写成事实。核心字段为 target_users、problem、workflow、mvp_scope、success_criteria。信息不足时 ready_for_draft 必须为 false。\n"
-            f"完整访谈记录：\n{transcript}")
+            f"{reference}完整访谈记录：\n{transcript}")
 
 
 def _discovery_tool() -> dict:
@@ -350,6 +371,61 @@ def _client(snapshot: dict | None = None) -> Anthropic:
     return Anthropic(**kwargs)
 
 
+teardowns = TeardownService(
+    STATE_DIR / "teardowns", ROOT / "skills" / "product-teardown", _resolve_model, _client,
+)
+
+
+def _create_teardown_project(run_id: str, request_id: object) -> tuple[int, dict]:
+    if not isinstance(request_id, str) or not re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", request_id):
+        raise TeardownError("导入请求无效，请重新打开确认弹框。")
+
+    def existing_project(state):
+        for item in state["sessions"]:
+            imported = item.get("teardown_import") or {}
+            if imported.get("request_id") == request_id:
+                if imported["run_id"] != run_id:
+                    raise TeardownError("导入请求已用于另一份拆解。", 409)
+                return item
+        return None
+
+    with _lock:
+        existing = existing_project(_read_state())
+        if existing:
+            return 200, existing
+
+    run = teardowns.project_source(run_id)
+    draft = project_draft(run)
+    selection = run["model_selection"]
+    try:
+        _resolve_model(selection)
+    except ValueError:
+        selection = None
+    project = _new_project_session(draft, "prd", selection, title=project_title(run), reference_only=True)
+    destination = OUTPUT_DIR / project["id"]
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".teardown-import-", dir=OUTPUT_DIR) as temporary:
+            staged = Path(temporary) / "project"
+            manifest = teardowns.copy_project_reports(run, staged / "teardown")
+            project["teardown_import"] = {**manifest, "run_id": run_id, "request_id": request_id, "draft": draft}
+            with _lock:
+                state = _read_state()
+                existing = existing_project(state)
+                if existing:
+                    return 200, existing
+                staged.rename(destination)
+                try:
+                    state["sessions"].insert(0, project)
+                    _save_state(state)
+                except OSError:
+                    shutil.rmtree(destination, ignore_errors=True)
+                    raise
+    except OSError as exc:
+        raise TeardownError("无法保存拆解资料，请检查本地存储后重试。", 500) from exc
+    return 201, project
+
+
 def _model(snapshot: dict | None = None) -> str:
     return snapshot["model"]
 
@@ -470,6 +546,10 @@ def _validate_generated_files(session_id: str, response) -> list:
     if not isinstance(files, list) or not files:
         raise ValueError("模型没有生成文件，请重试或更换支持工具调用的模型。")
     destination = (OUTPUT_DIR / session_id).resolve()
+    with _lock:
+        session = _find_session(_read_state(), session_id)
+        has_import = bool(session and session.get("teardown_import"))
+    reference_folder = destination / "teardown"
     seen = set()
     for item in files:
         if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not isinstance(item.get("content"), str):
@@ -478,6 +558,8 @@ def _validate_generated_files(session_id: str, response) -> list:
         target = (destination / path).resolve()
         if path.is_absolute() or not path.parts or any(x in ("..", ".") for x in path.parts) or not target.is_relative_to(destination) or target in seen:
             raise ValueError("模型返回了无效或重复的文件路径，请重试。")
+        if has_import and target.is_relative_to(reference_folder):
+            raise ValueError("teardown/ 保存着导入的拆解资料，请将生成文件写到其他目录。")
         seen.add(target)
     return files
 
@@ -497,6 +579,10 @@ def _run_job(operation_id: str, session_id: str, phase: str, prompt: str,
             request_args.update({"tools": [_discovery_tool()],
                                  "tool_choice": {"type": "tool", "name": "discovery_update"}})
         elif save_result and phase in ("frontend", "backend"):
+            with _lock:
+                project = _find_session(_read_state(), session_id)
+            if project and project.get("teardown_import"):
+                request_args["system"] += "\n项目目录下的 teardown/ 保存产品拆解报告，请将生成文件写到其他目录。"
             request_args.update({
                 "tools": [{"name": "save_files", "description": "将生成的源代码保存为项目文件。",
                            "input_schema": {"type": "object", "properties": {
@@ -645,10 +731,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _body(self) -> dict:
+    def _body(self, max_length: int = 2_000_000) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
-        if length > 2_000_000:
-            raise ValueError("请求内容超过 2 MB。")
+        if length < 0:
+            raise ValueError("请求大小无效。")
+        if length > max_length:
+            raise ValueError("请求内容超过 2 MB。" if max_length == 2_000_000 else "截图请求超出大小限制。")
         data = json.loads(self.rfile.read(length) or b"{}")
         if not isinstance(data, dict):
             raise ValueError("请求必须是 JSON 对象。")
@@ -663,10 +751,70 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; base-uri 'self'; frame-ancestors 'none'")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _get_teardown(self, path: str) -> None:
+        if path == "/api/teardown/runs":
+            return self._json(200, {"runs": teardowns.summaries()})
+        match = re.fullmatch(rf"/api/teardown/runs/({RUN_ID_PATTERN})(?:/(download\.zip|source\.zip|screenshots/S\d{{2,3}}|reports/[a-z]+))?", path)
+        if not match:
+            return self._json(404, {"error": "拆解接口不存在。"})
+        run_id, resource = match.groups()
+        if resource is None:
+            return self._json(200, {"run": teardowns.public_run(teardowns.read(run_id))})
+        if resource.startswith("reports/"):
+            data = teardowns.report_html(run_id, resource.rsplit("/", 1)[-1]).encode()
+            return self._send_teardown_file(io.BytesIO(data), len(data), "text/html; charset=utf-8", embed=True)
+        if resource == "download.zip":
+            with tempfile.TemporaryFile() as archive:
+                teardowns.write_archive(run_id, archive)
+                size = archive.tell()
+                archive.seek(0)
+                return self._send_teardown_file(archive, size, "application/zip", f"nexus-teardown-{run_id[:8]}.zip")
+        if resource == "source.zip":
+            archive_path, name = teardowns.source_archive(run_id)
+            with archive_path.open("rb") as archive:
+                return self._send_teardown_file(archive, archive_path.stat().st_size, "application/zip", name)
+        data, mime = teardowns.screenshot(run_id, resource.rsplit("/", 1)[-1])
+        return self._send_teardown_file(io.BytesIO(data), len(data), mime)
+
+    def _send_teardown_file(self, stream, size: int, mime: str, name: str | None = None, *, embed: bool = False) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if mime.startswith("text/html"):
+            ancestors = "'self'" if embed else "'none'"
+            self.send_header("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors {ancestors}; base-uri 'none'")
+        if name:
+            ascii_name = f'filename="{name}"; ' if re.fullmatch(r"[A-Za-z0-9._-]+", name) else ""
+            self.send_header("Content-Disposition", f"attachment; {ascii_name}filename*=UTF-8''{quote(name, safe='')}")
+        self.end_headers()
+        shutil.copyfileobj(stream, self.wfile)
+
+    def _get_project_teardown_file(self, project_id: str, relative: str) -> None:
+        with _lock:
+            project = _find_session(_read_state(), project_id)
+            imported = project.get("teardown_import") if project else None
+        if not imported or relative not in imported["files"]:
+            return self._json(404, {"error": "项目拆解资料不存在。"})
+        folder = (OUTPUT_DIR / project_id / "teardown").resolve()
+        candidate = (folder / relative).resolve()
+        if not candidate.is_relative_to(folder) or not candidate.is_file():
+            return self._json(404, {"error": "项目拆解资料不存在。"})
+        mime = {
+            ".html": "text/html; charset=utf-8", ".csv": "text/csv; charset=utf-8",
+            ".png": "image/png", ".jpg": "image/jpeg", ".zip": "application/zip",
+        }.get(candidate.suffix, "application/octet-stream")
+        name = imported["archive_name"] if relative == "source.zip" else None
+        if candidate.suffix == ".csv":
+            name = candidate.name
+        with candidate.open("rb") as entry:
+            return self._send_teardown_file(entry, candidate.stat().st_size, mime, name, embed=candidate.suffix == ".html")
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -674,25 +822,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._file(WEB / "index.html")
         if parsed.path.startswith("/assets/"):
             return self._file(WEB / Path(unquote(parsed.path)).name)
+        if parsed.path.startswith("/api/teardown/"):
+            try:
+                return self._get_teardown(parsed.path)
+            except TeardownError as exc:
+                return self._json(exc.status, {"error": str(exc)})
+        match = re.fullmatch(r"/api/sessions/([a-f0-9-]+)/teardown/(.+)", unquote(parsed.path))
+        if match:
+            return self._get_project_teardown_file(*match.groups())
         match = re.fullmatch(r"/api/sessions/([a-f0-9-]+)/download\.zip", parsed.path)
         if match:
-            folder = (OUTPUT_DIR / match.group(1)).resolve()
-            archive = io.BytesIO()
-            if folder.is_dir():
+            project_id = match.group(1)
+            folder = (OUTPUT_DIR / project_id).resolve()
+            if not folder.is_dir():
+                return self._json(404, {"error": "还没有可下载的项目成果。"})
+            with _lock:
+                project = _find_session(_read_state(), project_id)
+                imported = project.get("teardown_import") if project else None
+            with tempfile.TemporaryFile() as archive:
                 with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
                     for path in sorted(folder.rglob("*")):
                         if path.is_file() and path.resolve().is_relative_to(folder):
-                            bundle.write(path, path.relative_to(folder).as_posix())
-            if archive.tell() == 0:
-                return self._json(404, {"error": "还没有可下载的项目成果。"})
-            data = archive.getvalue()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", f'attachment; filename="nexus-{match.group(1)[:8]}.zip"')
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            return self.wfile.write(data)
+                            compression = zipfile.ZIP_STORED if path.suffix == ".zip" else None
+                            bundle.write(path, path.relative_to(folder).as_posix(), compress_type=compression)
+                    if imported:
+                        bundle.writestr("teardown/需求草稿.md", imported["draft"].encode())
+                size = archive.tell()
+                archive.seek(0)
+                return self._send_teardown_file(archive, size, "application/zip", f"nexus-{project_id[:8]}.zip")
         if parsed.path in ("/api/health", "/api/models"):
             providers = _public_models(_read_models())
             return self._json(200, {"configured": any(p["models"] and p["has_key"] for p in providers), "providers": providers})
@@ -740,6 +897,25 @@ class Handler(BaseHTTPRequestHandler):
                 origin_url = urlparse(origin)
                 if origin_url.scheme != "http" or origin_url.hostname not in ("127.0.0.1", "localhost") or origin_url.port != PORT:
                     return self._json(403, {"error": "仅接受本地工作台的请求。"})
+            if self.path == "/api/teardown/runs":
+                if self.headers.get_content_type() == "multipart/form-data":
+                    with tempfile.TemporaryDirectory(prefix="nexus-upload-") as temp:
+                        body, uploads = parse_upload(
+                            self.rfile, self.headers["Content-Type"], int(self.headers.get("Content-Length", "0")), Path(temp),
+                        )
+                        run = teardowns.create(body, uploads=uploads)
+                else:
+                    run = teardowns.create(self._body(MAX_LEGACY_REQUEST_BYTES))
+                return self._json(202, {"run": teardowns.public_run(run)})
+            teardown_action = re.fullmatch(rf"/api/teardown/runs/({RUN_ID_PATTERN})/(confirm|retry)", self.path)
+            if teardown_action:
+                run_id, action = teardown_action.groups()
+                run = teardowns.advance(run_id, action, self._body().get("model_selection"))
+                return self._json(202, {"run": teardowns.public_run(run)})
+            teardown_import = re.fullmatch(rf"/api/teardown/runs/({RUN_ID_PATTERN})/project", self.path)
+            if teardown_import:
+                status, project = _create_teardown_project(teardown_import.group(1), self._body().get("request_id"))
+                return self._json(status, {"session": project})
             body = self._body()
             if self.path == "/api/models":
                 with _lock:
@@ -930,18 +1106,30 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(400, {"error": "需求入口类型无效。"})
                 selection = body.get("model_selection")
                 _resolve_model(selection)
-                session_id = str(uuid.uuid4())
-                session = {"model_selection": {"provider_id": selection["provider_id"], "model": selection["model"]}, "id": session_id, "title": (brief[:38] or "新建产品项目"), "brief": brief,
-                           "phase": "brief", "status": "ready", "generation_scope": "fullstack",
-                           "entry_mode": entry_mode, "discovery": _new_discovery(entry_mode),
-                           "selected_components": [], "approvals": {}, "phase_results": {},
-                           "messages": ([{"role": "user", "content": brief, "created_at": _now()}] if brief else []),
-                           "error": "", "created_at": _now(), "updated_at": _now()}
+                session = _new_project_session(brief, entry_mode, selection)
                 with _lock:
                     state = _read_state()
                     state["sessions"].insert(0, session)
                     _save_state(state)
                 return self._json(201, {"session": session})
+            match = re.fullmatch(r"/api/sessions/([a-f0-9-]+)/teardown/draft", self.path)
+            if match:
+                draft = body.get("draft")
+                if not isinstance(draft, str) or not draft.strip() or len(draft) > 30000:
+                    return self._json(400, {"error": "需求草稿不能为空，最多支持 30,000 字。"})
+                with _lock:
+                    state = _read_state()
+                    session = _find_session(state, match.group(1))
+                    imported = session.get("teardown_import") if session else None
+                    if not imported:
+                        return self._json(404, {"error": "项目拆解资料不存在。"})
+                    if (session["phase"] != "brief" or session["status"] != "ready"
+                            or session.get("discovery", {}).get("started")):
+                        return self._json(409, {"error": "需求访谈已开始，请在访谈中调整需求。"})
+                    imported["draft"] = session["brief"] = draft.strip()
+                    session["updated_at"] = _now()
+                    _save_state(state)
+                return self._json(200, {"session": session})
             match = re.fullmatch(r"/api/sessions/([a-f0-9-]+)/rename", self.path)
             if match:
                 title = body.get("title")
@@ -1192,6 +1380,8 @@ class Handler(BaseHTTPRequestHandler):
                     session["phase"], session["updated_at"] = next_phase, _now()
                     _save_state(state)
                     return self._json(200, {"session": session})
+        except TeardownError as exc:
+            return self._json(exc.status, {"error": str(exc)})
         except (ValueError, json.JSONDecodeError) as exc:
             return self._json(400, {"error": str(exc)})
         self._json(404, {"error": "接口不存在。"})
@@ -1201,6 +1391,7 @@ if __name__ == "__main__":
     if HOST != "127.0.0.1":
         raise RuntimeError("本地工作台必须绑定到 127.0.0.1。")
     _recover_interrupted_sessions()
+    teardowns.recover()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Nexus 工作台已启动：http://{HOST}:{PORT}")
     server.serve_forever()

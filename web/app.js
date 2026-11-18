@@ -53,10 +53,12 @@ let deleteError = '';
 let feishuImportGeneration = 0;
 const importedFeishuUrls = new Set();
 let feishuAuthFlowId = null;
+let teardownVisible = window.location.hash === '#teardown';
 
 function escapeHtml(value='') { return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 async function request(path, options={}) {
-  const response = await fetch(path,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});
+  const headers = options.body instanceof FormData ? options.headers : {'Content-Type':'application/json',...(options.headers||{})};
+  const response = await fetch(path,{...options,headers});
   const data = await response.json().catch(()=>({error:'服务器返回了无法读取的响应。'}));
   if (!response.ok) {const error=new Error(data.error||`请求失败 (${response.status})`);error.authRequired=Boolean(data.auth_required);throw error;}
   return data;
@@ -77,6 +79,7 @@ async function refreshHealth() {
   catch { config={configured:false,providers:[]}; }
   renderModelSelector();
   $('configDot').classList.toggle('configured',config.configured);
+  document.dispatchEvent(new Event('nexus:models'));
 }
 async function refreshSessions() {
   try { const data=await request('/api/sessions'); sessions=data.sessions||[]; }
@@ -229,11 +232,14 @@ function renderRight() {
   const scope=session?.generation_scope||'fullstack';
   const taskPhases=['brief','components','architecture','development',...(scope==='backend'?[]:['ui_design','frontend']),...(scope==='frontend'?[]:['backend']),'verification'];
   $('tasksList').innerHTML=taskPhases.map(id=>{const done=Boolean(resultFor(id));const running=session?.phase===id&&session?.status==='running';const label=phases.find(p=>p.id===id)?.label||id;return `<div class="task-state"><span class="task-indicator ${done?'':running?'running':'pending'}"></span><span>${label}</span><small>${done?'已完成':running?'进行中':'待开始'}</small></div>`}).join('');
-  $('deliverableTabs').innerHTML=deliverables.map(d=>`<button class="${activeDeliverable===d.id?'active':''}" data-deliverable="${d.id}">${d.label}</button>`).join('');
+  const imported=session?.teardown_import;
+  const tabs=imported ? [{id:'teardown',label:'产品拆解'},...deliverables] : deliverables;
+  $('deliverableTabs').innerHTML=tabs.map(d=>`<button class="${activeDeliverable===d.id?'active':''}" data-deliverable="${d.id}">${d.label}</button>`).join('');
   document.querySelectorAll('[data-deliverable]').forEach(b=>b.addEventListener('click',()=>{activeDeliverable=b.dataset.deliverable;renderRight()}));
   const data=resultFor(activeDeliverable==='requirements'?'brief':activeDeliverable);
   const artifacts=data?.artifacts||[];
-  $('fileCount').textContent=String(Object.values(session?.phase_results||{}).reduce((n,r)=>n+(r.artifacts||[]).length,0));
+  $('fileCount').textContent=String(Object.values(session?.phase_results||{}).reduce((n,r)=>n+(r.artifacts||[]).length,imported?.files.length||0));
+  if(activeDeliverable==='teardown'&&imported){renderTeardownMaterials(imported);return;}
   const content=[];
   if(data?.text) content.push(`<article class="artifact-card"><b>${deliverables.find(d=>d.id===activeDeliverable)?.label||'阶段成果'}</b><small>${escapeHtml(data.phase||'')} · ${escapeHtml(new Date().toLocaleDateString('zh-CN'))}</small><p>${escapeHtml(data.text)}</p></article>`);
   for(const file of artifacts) content.push(`<article class="artifact-card"><b>${escapeHtml(file)}</b><small>本地生成成果</small><a href="/api/sessions/${encodeURIComponent(session.id)}/file?path=${encodeURIComponent(file)}" download>下载文件 ↓</a></article>`);
@@ -241,9 +247,100 @@ function renderRight() {
   $('deliverableContent').innerHTML=content.join('')||'<div class="empty-deliverables">当前阶段还没有成果。<br>完成当前任务后，方案和文件会出现在这里。</div>';
   $('scopeCard').classList.toggle('hidden',!session?.approvals?.development);
 }
+function mountReadOnlyReport(panel, source, title, onLink) {
+  const frame=document.createElement('iframe');
+  frame.className='teardown-report-frame';
+  frame.title=title;
+  frame.height='320';
+  frame.setAttribute('sandbox','allow-same-origin');
+  let observer=null;
+  frame.addEventListener('load',()=>{
+    if(!frame.isConnected)return;
+    const document=frame.contentDocument;
+    const main=document?.querySelector('main');
+    if(!main){
+      panel.textContent='报告加载失败，请刷新页面重试。';
+      return;
+    }
+    const outline=main.querySelector('.report-outline ol');
+    if(outline){
+      outline.style.listStyle='none';
+      outline.style.paddingInlineStart='0';
+    }
+    const fit=()=>{frame.height=String(Math.ceil(main.getBoundingClientRect().height))};
+    fit();
+    observer=new ResizeObserver(fit);
+    observer.observe(main);
+    document.addEventListener('click',event=>{
+      const link=event.target.closest('a[href]');
+      if(link&&onLink?.(link))event.preventDefault();
+    });
+  },{once:true});
+  frame.src=source;
+  panel.replaceChildren(frame);
+  return ()=>observer?.disconnect();
+}
+function renderTeardownMaterials(imported) {
+  const projectId=session.id;
+  const files=`/api/sessions/${encodeURIComponent(projectId)}/teardown`;
+  const canEdit=session.phase==='brief'&&session.status==='ready'&&!session.discovery?.started;
+  const reports=imported.reports.map(report=>`<article class="artifact-card">
+    <b>${escapeHtml(report.title)}</b>
+    <a href="${files}/${encodeURIComponent(report.path)}" target="_blank" rel="noopener">查看 HTML 报告 ↗</a>
+  </article>`).join('');
+  const archive=imported.archive_name
+    ? `<a href="${files}/source.zip" download>下载原始 ZIP · ${escapeHtml(imported.archive_name)}</a>` : '';
+  $('deliverableContent').innerHTML=`<section class="teardown-materials">
+    <details class="teardown-project-draft">
+      <summary>需求草稿（Markdown）</summary>
+      <form>
+        <textarea id="teardownProjectDraft" aria-label="需求草稿（Markdown）" rows="9" maxlength="30000" required ${canEdit?'':'readonly'}>${escapeHtml(imported.draft)}</textarea>
+        ${canEdit?'<button type="submit" class="secondary-button">保存草稿</button><p class="teardown-materials-status" role="status"></p>':''}
+      </form>
+    </details>
+    <h3>完整分析报告</h3>
+    ${reports}
+    <article class="artifact-card">
+      <b>截图证据 · ${imported.screenshot_count} 张</b>
+      <a href="${files}/${encodeURIComponent('图片清单.csv')}" download>下载图片清单</a>
+      ${archive}
+      <a href="/api/sessions/${encodeURIComponent(projectId)}/download.zip" download>下载项目资料 ZIP</a>
+    </article>
+  </section>`;
+  if(canEdit) $('deliverableContent').querySelector('form').addEventListener('submit', event=>{
+    event.preventDefault();
+    saveTeardownDraft(projectId,event.currentTarget);
+  });
+}
+async function saveTeardownDraft(projectId, form) {
+  const draft=form.querySelector('textarea');
+  const button=form.querySelector('button');
+  const status=form.querySelector('[role="status"]');
+  button.disabled=draft.readOnly=true;
+  status.textContent='正在保存…';
+  try {
+    const data=await request(`/api/sessions/${encodeURIComponent(projectId)}/teardown/draft`,{
+      method:'POST',body:JSON.stringify({draft:draft.value}),
+    });
+    if(session?.id===projectId && session.phase==='brief' && session.status==='ready' && !session.discovery?.started) {
+      session.brief=data.session.brief;
+      session.teardown_import.draft=data.session.teardown_import.draft;
+      draft.value=session.brief;
+    }
+    status.textContent='草稿已保存';
+  } catch(error) {
+    status.textContent=error.message;
+  } finally {
+    button.disabled=draft.readOnly=false;
+  }
+}
 function renderWorkspace() {
   const has=Boolean(session);
-  $('welcome').classList.toggle('hidden',has); $('workspace').classList.toggle('hidden',!has);
+  $('welcome').classList.toggle('hidden',teardownVisible || has);
+  $('workspace').classList.toggle('hidden',teardownVisible || !has);
+  $('teardown').classList.toggle('hidden',!teardownVisible);
+  $('projectTopActions').classList.toggle('hidden',teardownVisible);
+  if(teardownVisible)return;
   if(!has){$('projectTitle').textContent='新建项目';renderModelSelector();return;}
   if(rightPanelPreferredWidth!==null)applyRightPanelWidth(rightPanelPreferredWidth);
   else updateSplitterAria();
@@ -261,7 +358,7 @@ function renderWorkspace() {
   refreshSessions();
 }
 async function openSession(id) {
-  try { const data=await request(`/api/sessions/${encodeURIComponent(id)}`);session=data.session;activeDeliverable='requirements';renderWorkspace(); }
+  try { const data=await request(`/api/sessions/${encodeURIComponent(id)}`);session=data.session;activeDeliverable='requirements';showProjectWorkspace(); }
   catch(e){showError(e.message)}
 }
 function showError(message) { $('errorBanner').textContent=message;$('errorBanner').classList.remove('hidden'); }
@@ -276,12 +373,12 @@ async function createProject(brief) {
 }
 async function startDiscovery() {
   if(!session)return;
+  const projectId=session.id;
   try {
     session.status='running';session.phase='brief';session.error='';session.discovery=session.discovery||{entry_mode:session.entry_mode||'idea',facts:{},open_questions:[],status:'interviewing'};renderWorkspace();
-    const data=await request('/api/discovery/start',{method:'POST',body:JSON.stringify({session_id:session.id})});
-    await pollJob(data.job_id);
-    if(session?.discovery)session.discovery.started=true;
-  } catch(e){session.status='ready';session.error=e.message;renderWorkspace()}
+    const data=await request('/api/discovery/start',{method:'POST',body:JSON.stringify({session_id:projectId})});
+    await pollJob(data.job_id,projectId);
+  } catch(e){if(session?.id===projectId){session.status='ready';session.error=e.message;renderWorkspace()}}
 }
 async function createPrdDraft() {
   if(!session)return;
@@ -293,29 +390,34 @@ async function reopenDiscovery() {
   try {const data=await request('/api/discovery/reopen',{method:'POST',body:JSON.stringify({session_id:session.id})});session=data.session;activeDeliverable='requirements';renderWorkspace();}
   catch(e){showError(e.message)}
 }
-async function pollJob(jobId) {
+async function pollJob(jobId, projectId) {
+  if(session?.id!==projectId)return;
   pendingJob=jobId;
   for(let i=0;i<360;i++) {
     await new Promise(r=>setTimeout(r,1000));
-    if(pendingJob!==jobId)return;
+    if(pendingJob!==jobId||session?.id!==projectId)return;
     try {
       const job=await request(`/api/jobs/${encodeURIComponent(jobId)}`);
       if(job.status==='running')continue;
-      const refreshed=await request(`/api/sessions/${encodeURIComponent(session.id)}`);session=refreshed.session;pendingJob=null;
+      const refreshed=await request(`/api/sessions/${encodeURIComponent(projectId)}`);
+      if(pendingJob!==jobId||session?.id!==projectId)return;
+      session=refreshed.session;pendingJob=null;
       if(job.status==='failed')session.error=job.error||'模型任务失败。';
       renderWorkspace();return;
-    } catch(e){session.error=e.message;pendingJob=null;renderWorkspace();return;}
+    } catch(e){if(pendingJob===jobId&&session?.id===projectId){session.error=e.message;pendingJob=null;renderWorkspace()}return;}
   }
+  if(pendingJob!==jobId||session?.id!==projectId)return;
   pendingJob=null;session.status='ready';session.error='任务等待时间较长，请检查连接后重试。';renderWorkspace();
 }
 async function runPhase(phase) {
   if(!session)return;
   if(!config.configured){openModelSettings();return;}
+  const projectId=session.id;
   try {
     session.phase=phase;session.status='running';session.error='';renderWorkspace();
-    const data=await request('/api/run',{method:'POST',body:JSON.stringify({session_id:session.id,phase})});
-    await pollJob(data.job_id);
-  } catch(e) { session.status='ready';session.error=e.message;renderWorkspace(); }
+    const data=await request('/api/run',{method:'POST',body:JSON.stringify({session_id:projectId,phase})});
+    await pollJob(data.job_id,projectId);
+  } catch(e) { if(session?.id===projectId){session.status='ready';session.error=e.message;renderWorkspace()} }
 }
 async function approvePhase(phase) {
   if(!session)return;
@@ -339,20 +441,22 @@ function changePhase(phase) {
 async function sendChat() {
   const message=$('chatInput').value.trim();if(!message||!session)return;
   if(!config.configured){openModelSettings();return;}
+  const projectId=session.id;
   try {
     session.messages.push({role:'user',content:message});session.status='running';session.error='';$('chatInput').value='';renderWorkspace();
-    const data=await request('/api/chat',{method:'POST',body:JSON.stringify({session_id:session.id,message})});
-    await pollJob(data.job_id);
-  } catch(e){session.status='ready';session.error=e.message;renderWorkspace()}
+    const data=await request('/api/chat',{method:'POST',body:JSON.stringify({session_id:projectId,message})});
+    await pollJob(data.job_id,projectId);
+  } catch(e){if(session?.id===projectId){session.status='ready';session.error=e.message;renderWorkspace()}}
 }
 async function continueAnswer() {
   if(!session)return;
   if(!config.configured){openModelSettings();return;}
+  const projectId=session.id;
   try {
     session.status='running';session.error='';renderWorkspace();
-    const data=await request('/api/continue',{method:'POST',body:JSON.stringify({session_id:session.id})});
-    await pollJob(data.job_id);
-  } catch(e){session.status='ready';session.error=e.message;renderWorkspace()}
+    const data=await request('/api/continue',{method:'POST',body:JSON.stringify({session_id:projectId})});
+    await pollJob(data.job_id,projectId);
+  } catch(e){if(session?.id===projectId){session.status='ready';session.error=e.message;renderWorkspace()}}
 }
 function showSettingsMessage(message, error=true) {$('settingsError').textContent=message;$('settingsError').classList.toggle('hidden',!message);$('settingsError').classList.toggle('success',!error);}
 function modelNames() {return [...new Set($('modelNames').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))];}
@@ -488,7 +592,39 @@ async function startProjectFromWelcome() {
   }
   createProject(brief);
 }
-$('newProject').addEventListener('click',()=>{session=null;draftModel=null;renderModelSelector();pendingJob=null;activeDeliverable='requirements';resetNewProjectForm();renderWorkspace();$('briefInput').focus()});
+function syncWorkbenchView() {
+  teardownVisible=window.location.hash==='#teardown';
+  $('projectTab').removeAttribute('aria-current');
+  $('teardownTab').removeAttribute('aria-current');
+  $(teardownVisible?'teardownTab':'projectTab').setAttribute('aria-current','page');
+  renderWorkspace();
+  document.dispatchEvent(new Event('nexus:workbench'));
+}
+function showProjectWorkspace() {
+  if(teardownVisible)history.replaceState(null,'','#project');
+  syncWorkbenchView();
+}
+function openImportedProject(project) {
+  pendingJob=null;
+  session=project;
+  activeDeliverable='teardown';
+  $('deliverables').classList.add('visible');
+  $('workGrid').classList.remove('panel-hidden');
+  showProjectWorkspace();
+}
+function resetProjectWorkspace() {
+  session=null;
+  draftModel=null;
+  pendingJob=null;
+  activeDeliverable='requirements';
+  resetNewProjectForm();
+}
+window.addEventListener('hashchange',syncWorkbenchView);
+$('newProject').addEventListener('click',()=>{
+  resetProjectWorkspace();
+  showProjectWorkspace();
+  $('briefInput').focus();
+});
 $('startProject').addEventListener('click',startProjectFromWelcome);
 $('loadFeishuPrd').addEventListener('click',loadFeishuPrd);
 $('connectFeishu').addEventListener('click',startFeishuAuth);
@@ -607,4 +743,5 @@ $('toggleRight').addEventListener('click',()=>{
   if(mobile)$('deliverables').classList.toggle('visible');
   else{$('workGrid').classList.toggle('panel-hidden');if(!$('workGrid').classList.contains('panel-hidden'))requestAnimationFrame(updateSplitterAria)}
 });
+syncWorkbenchView();
 refreshHealth();refreshSessions().then(()=>renderWorkspace());
