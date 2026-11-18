@@ -162,7 +162,7 @@ def agent_loop(messages):
 
 五阶段全部完成后，点击「带入项目工作区」，确认创建新项目。新项目的「产品拆解」资料页列出各阶段报告，可在新标签页打开 HTML 报告和查看截图证据。开始需求访谈前，可展开「需求草稿（Markdown）」编辑并保存草稿。
 
-项目自带 [OiiOii 示例](skills/product-teardown/examples/README.md)，包含三张有顺序的截图、图片清单和 [可直接打开的参考报告](skills/product-teardown/examples/oiioii/index.html)。已安装旧版本的用户可重新运行 `./setup.sh` 安装截图校验依赖。拆解记录和上传截图保存在本机 `.webapp/teardowns/` 下。
+已安装旧版本的用户可重新运行 `./setup.sh` 安装截图校验依赖。拆解记录和上传截图保存在本机 `.webapp/teardowns/` 下。本地测试样例可放在 `skills/product-teardown/examples/`，该目录由 Git 忽略。
 
 ### 学生上手：3 步跑起来（macOS + VS Code）
 

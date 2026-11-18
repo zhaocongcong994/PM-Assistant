@@ -15,13 +15,9 @@ SKILL = Path(__file__).resolve().parents[1] / "skills" / "product-teardown"
 SELECTION = {"provider_id": "example-provider", "model": "example-model"}
 
 
-def _file(path):
-    return {"name": path.name, "data": base64.b64encode(path.read_bytes()).decode("ascii")}
-
-
 def _reply(label, level="页面事实", screenshots=None):
     return {"reports": [{"title": label, "sections": [{"title": "贡献 <script>", "items": [{
-        "title": "可核对的发现", "text": '截图中的「满意，请继续」正在显示。<script>alert(1)</script>',
+        "title": "可核对的发现", "text": '页面显示操作已完成。<script>alert(1)</script>',
         "level": level, "screenshots": ["S02"] if screenshots is None else screenshots,
     }]}]}]}
 
@@ -66,9 +62,14 @@ def workflow(tmp_path, monkeypatch):
 
 @pytest.fixture
 def example_request():
-    paths = sorted((SKILL / "examples" / "oiioii" / "screenshots").glob("*.png"))
-    assert len(paths) == 3
-    return {"title": "OiiOii", "model_selection": SELECTION, "screenshots": [_file(path) for path in paths]}
+    screenshots = [
+        {
+            "name": f"step-{index:02}.png",
+            "data": base64.b64encode(_encoded_image(color=color)).decode("ascii"),
+        }
+        for index, color in enumerate(("red", "green", "blue"), start=1)
+    ]
+    return {"title": "测试产品", "model_selection": SELECTION, "screenshots": screenshots}
 
 
 def test_example_confirmation_retry_and_offline_report(workflow, example_request):
@@ -339,7 +340,7 @@ def test_project_import_reuses_retry_and_copies_complete_evidence(workflow, exam
     assert sorted([first[0], second[0]]) == [200, 201]
     project = first[1]
     assert project["id"] == second[1]["id"] and len(web_app._read_state()["sessions"]) == 1
-    assert project["title"] == "OiiOii · 产品拆解" and project["phase"] == "brief"
+    assert project["title"] == f"{example_request['title']} · 产品拆解" and project["phase"] == "brief"
     assert not project["messages"] and not project["discovery"]["started"]
     assert "## 关键发现" in project["brief"] and "## 待确认问题" in project["brief"]
     assert "产品拆解参考资料" in web_app._discovery_context(project)
